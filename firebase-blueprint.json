@@ -1,0 +1,133 @@
+{
+  "entities": {
+    "user": {
+      "title": "User",
+      "description": "User entity",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "username": { "type": "string" },
+        "role": { "type": "string" },
+        "fullName": { "type": "string" },
+        "password": { "type": "string" }
+      },
+      "required": ["id", "username", "role", "fullName", "password"]
+    },
+    "student": {
+      "title": "Student",
+      "description": "Student entity",
+      "type": "object",
+      "properties": {
+        "studentId": { "type": "string" },
+        "fullName": { "type": "string" },
+        "department": { "type": "string" },
+        "program": { "type": "string" },
+        "yearLevel": { "type": "string" },
+        "section": { "type": "string" },
+        "createdAt": { "type": "string" }
+      },
+      "required": ["studentId", "fullName", "department", "program", "yearLevel", "section"]
+    },
+    "department": {
+      "title": "Department",
+      "description": "Department entity",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "code": { "type": "string" }
+      },
+      "required": ["id", "name", "code"]
+    },
+    "program": {
+      "title": "Program",
+      "description": "Program entity",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "code": { "type": "string" },
+        "departmentCode": { "type": "string" }
+      },
+      "required": ["id", "name", "code", "departmentCode"]
+    },
+    "section": {
+      "title": "Section",
+      "description": "Section entity",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" }
+      },
+      "required": ["id", "name"]
+    },
+    "event": {
+      "title": "Event",
+      "description": "Event entity",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "description": { "type": "string" },
+        "date": { "type": "string" },
+        "isActive": { "type": "boolean" },
+        "sanctionTime": { "type": "string" },
+        "sanctionHours": { "type": "number" },
+        "createdAt": { "type": "string" },
+        "sessions": { "type": "string" }
+      },
+      "required": ["id", "name", "date", "isActive"]
+    },
+    "attendance": {
+      "title": "AttendanceRecord",
+      "description": "Attendance Record entity",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "studentId": { "type": "string" },
+        "studentName": { "type": "string" },
+        "department": { "type": "string" },
+        "program": { "type": "string" },
+        "yearLevel": { "type": "string" },
+        "section": { "type": "string" },
+        "eventId": { "type": "string" },
+        "eventName": { "type": "string" },
+        "date": { "type": "string" },
+        "timeIn": { "type": "string" },
+        "timeOut": { "type": "string" },
+        "scannedBy": { "type": "string" }
+      },
+      "required": ["id", "studentId", "studentName", "eventId", "date", "timeIn", "scannedBy"]
+    }
+  },
+  "firestore": {
+    "users": {
+      "schema": "user",
+      "description": "Users of the system"
+    },
+    "students": {
+      "schema": "student",
+      "description": "Registered students"
+    },
+    "departments": {
+      "schema": "department",
+      "description": "Academic departments"
+    },
+    "programs": {
+      "schema": "program",
+      "description": "Academic programs"
+    },
+    "sections": {
+      "schema": "section",
+      "description": "Academic sections"
+    },
+    "events": {
+      "schema": "event",
+      "description": "Institutional events"
+    },
+    "attendance": {
+      "schema": "attendance",
+      "description": "Student attendance scan logs"
+    }
+  }
+}

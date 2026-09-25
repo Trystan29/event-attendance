@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>CET Attendance System</title>
+    <script>
+      // Diagnostic Telemetry: Captures missing assets, runtime exceptions, or module errors
+      window.addEventListener('error', function(event) {
+        var msg = event.message || '';
+        var src = event.filename || (event.target && event.target.src) || '';
+        
+        // Ignore generic cross-origin "Script error." which is masked by browser security CORS policies
+        // and ignore browser extensions (e.g., chrome-extension://) or third-party tracking scripts
+        if (msg === 'Script error.' || msg.indexOf('Script error') !== -1 || src.indexOf('chrome-extension:') !== -1) {
+          return;
+        }
+
+        var errorData = {
+          message: event.message || (event.target && event.target.src ? 'Failed to load resource: ' + event.target.src : 'Unknown error'),
+          source: src || null,
+          lineno: event.lineno || null,
+          colno: event.colno || null,
+          stack: event.error ? event.error.stack : null,
+          type: 'window.error_event'
+        };
+        fetch('/api/client-error', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(errorData)
+        }).catch(function(err) {});
+      }, true);
+
+      window.addEventListener('unhandledrejection', function(event) {
+        var reason = event.reason || {};
+        var msg = reason.message || String(event.reason || '');
+        var stack = reason.stack || '';
+
+        // Ignore unhandled rejections from external chrome extensions or browser helper scripts
+        if (stack.indexOf('chrome-extension:') !== -1 || msg.indexOf('extension') !== -1) {
+          return;
+        }
+
+        // Ignore benign WebSocket/Vite/HMR/Socket connection failures which are expected in sandbox dev environments
+        if (msg.indexOf('WebSocket') !== -1 || msg.indexOf('websocket') !== -1 || stack.indexOf('@vite/client') !== -1 || msg.indexOf('vite') !== -1) {
+          event.preventDefault();
+          return;
+        }
+
+        // Mark as handled to prevent browser-default warnings/overlays
+        event.preventDefault();
+
+        var errorData = {
+          message: msg || 'Unhandled Promise Rejection',
+          stack: stack || null,
+          type: 'unhandledrejection'
+        };
+        fetch('/api/client-error', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(errorData)
+        }).catch(function(err) {});
+      });
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script>
+      // Passive silent cleanup of any legacy Service Workers or offline caches
+      if ('serviceWorker' in navigator) {
+        navigator.serviceWorker.getRegistrations().then((registrations) => {
+          for (const reg of registrations) {
+            reg.unregister();
+          }
+        });
+      }
+      if ('caches' in window) {
+        caches.keys().then((keys) => {
+          for (const key of keys) {
+            caches.delete(key);
+          }
+        });
+      }
+    </script>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
+

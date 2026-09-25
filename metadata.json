@@ -1,0 +1,6 @@
+{
+  "name": "CET Attendance System",
+  "description": "College of Engineering and Technology (CET) - QR Code Attendance Management System.",
+  "requestFramePermissions": ["camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

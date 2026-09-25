@@ -1,0 +1,72 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap');
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-display: "Space Grotesk", sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+
+  /* Redefine BLUE color scales to map beautifully to Crimson Red & White/Black accents */
+  --color-blue-50: #fef2f2;
+  --color-blue-105: #fef2f2;
+  --color-blue-100: #fee2e2;
+  --color-blue-200: #fecaca;
+  --color-blue-300: #fca5a5;
+  --color-blue-400: #f87171;
+  --color-blue-500: #991b1b; /* Primary Crimson */
+  --color-blue-600: #b91c1c; /* Accent Crimson / Red hover */
+  --color-blue-700: #7f1d1d; /* Darker Crimson */
+  --color-blue-800: #450a0a;
+  --color-blue-900: #18181b; /* Charcoal for high-contrast slate text replacement */
+  --color-blue-950: #09090b;
+
+  /* Redefine ORANGE color scales to Gold and Crimson */
+  --color-orange-50: #fffbeb;  /* Soft Warm/Yellow tint for backgrounds */
+  --color-orange-100: #fef3c7; /* Warm background borders */
+  --color-orange-200: #fde68a;
+  --color-orange-300: #fcd34d;
+  --color-orange-400: #fbbf24; /* Vivid Gold/Yellow accent */
+  --color-orange-500: #eab308; /* Secondary Gold/Amber */
+  --color-orange-600: #991b1b; /* Map button bg to Crimson */
+  --color-orange-750: #7f1d1d;
+  --color-orange-700: #b91c1c; /* Crimson hover bg */
+  --color-orange-850: #0f172a;
+  --color-orange-900: #18181b; /* Dark charcoal */
+  --color-orange-950: #09090b; /* Pure Carbon Black for Sidebar background */
+
+  /* Redefine INDIGO color scales to handle modal and student manager states */
+  --color-indigo-50: #f8fafc;
+  --color-indigo-100: #f1f5f9;
+  --color-indigo-200: #e2e8f0;
+  --color-indigo-300: #cbd5e1;
+  --color-indigo-400: #94a3b8;
+  --color-indigo-500: #991b1b; /* Map to high-contrast red */
+  --color-indigo-600: #b91c1c; /* Dark red */
+  --color-indigo-700: #7f1d1d;
+  --color-indigo-850: #18181b;
+  --color-indigo-900: #1e293b;
+  --color-indigo-950: #09090b;
+
+  /* Custom Red, Black, Yellow, White shortcuts */
+  --color-brand-red: #991b1b; /* keeps compatibility with text-brand-red / bg-brand-red */
+  --color-brand-green: #15803d;
+  --color-brand-black: #09090b;
+  --color-brand-yellow: #fbbf24;
+  --color-brand-white: #ffffff;
+}
+
+/* Custom Scrollbar styled dynamically with RED/GOLD */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: #18181b;
+}
+::-webkit-scrollbar-thumb {
+  background: #991b1b;
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #fbbf24;
+}
