@@ -13,6 +13,7 @@ export interface User {
 
 export interface Student {
   studentId: string; // Unique Identifier
+  qrCodeId?: string; // Stable badge identity; remains unchanged when the student number is corrected
   fullName: string;
   department: string;
   program: string;

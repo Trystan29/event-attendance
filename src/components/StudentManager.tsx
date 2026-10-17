@@ -5,6 +5,7 @@
 
 import React, { useEffect, useState, useRef } from 'react';
 import QRCode from 'qrcode';
+import * as XLSX from 'xlsx';
 import { 
   Plus, 
   Search, 
@@ -21,17 +22,53 @@ import {
   GraduationCap
 } from 'lucide-react';
 import { Student, Department, Program, Section } from '../types';
+import { normalizeStudentName, StudentNameOrder } from '../utils/studentName';
 
 interface StudentManagerProps {
   currentUserRole: 'admin' | 'staff';
 }
+
+interface ImportWorksheet {
+  name: string;
+  csv: string;
+}
+
+const parseCsvLine = (line: string): string[] => {
+  const cells: string[] = [];
+  let value = '';
+  let insideQuotes = false;
+  for (let index = 0; index < line.length; index++) {
+    const character = line[index];
+    if (character === '"') {
+      if (insideQuotes && line[index + 1] === '"') {
+        value += '"';
+        index++;
+      } else {
+        insideQuotes = !insideQuotes;
+      }
+    } else if (character === ',' && !insideQuotes) {
+      cells.push(value.trim());
+      value = '';
+    } else {
+      value += character;
+    }
+  }
+  cells.push(value.trim());
+  return cells;
+};
 
 export default function StudentManager({ currentUserRole }: StudentManagerProps) {
   const [students, setStudents] = useState<Student[]>([]);
   const [departments, setDepartments] = useState<Department[]>([]);
   const [programs, setPrograms] = useState<Program[]>([]);
   const [sections, setSections] = useState<Section[]>([]);
-  const filteredSections = sections.filter(s => s.name.toUpperCase() !== 'E');
+  // Hide 'E' and any section literally named FREE (the "Free Section" option is already built in)
+  const filteredSections = sections.filter(s => {
+    const n = s.name.trim().toUpperCase();
+    return n !== 'E' && n !== 'FREE';
+  });
+  // Stored year levels can be "FREE", "FREE Year", "free year", etc. - treat all as Free Year
+  const isFreeYear = (y: string | undefined | null) => String(y || '').trim().toUpperCase().startsWith('FREE');
   
   const [searchQuery, setSearchQuery] = useState('');
   const [filterDept, setFilterDept] = useState('');
@@ -47,6 +84,7 @@ export default function StudentManager({ currentUserRole }: StudentManagerProps)
   // Single Student focus
   const [viewedStudent, setViewedStudent] = useState<Student | null>(null);
   const [editingStudentId, setEditingStudentId] = useState<string | null>(null);
+  const [editingStudentDraft, setEditingStudentDraft] = useState<Pick<Student, 'studentId' | 'fullName' | 'department' | 'program' | 'yearLevel' | 'section'> | null>(null);
 
   // Form states
   const [newStudent, setNewStudent] = useState<Omit<Student, 'createdAt'>>({
@@ -59,10 +97,45 @@ export default function StudentManager({ currentUserRole }: StudentManagerProps)
   });
 
   const [importCsvInput, setImportCsvInput] = useState('');
+  const [importFileName, setImportFileName] = useState('');
+  const [importWorksheets, setImportWorksheets] = useState<ImportWorksheet[]>([]);
+  const [selectedImportWorksheet, setSelectedImportWorksheet] = useState('');
+  const [importPreviewSearch, setImportPreviewSearch] = useState('');
+  const [studentNameOrder, setStudentNameOrder] = useState<StudentNameOrder>('auto');
+  const [importMatchBy, setImportMatchBy] = useState<'studentId' | 'fullName'>('studentId');
+  const [importUpdateFields, setImportUpdateFields] = useState<Array<'studentId' | 'fullName' | 'department' | 'program' | 'yearLevel' | 'section'>>([
+    'fullName', 'department', 'program', 'yearLevel', 'section'
+  ]);
+  const [updateExistingStudents, setUpdateExistingStudents] = useState(true);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [qrCache, setQrCache] = useState<{ [id: string]: string }>({});
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
+  const getQrIdentity = (student: Student) => student.qrCodeId || student.studentId;
+
+  const normalizeImportedStudentName = (rawName: string, studentId: string) => {
+    if (studentNameOrder !== 'auto' || rawName.includes(',')) {
+      return normalizeStudentName(rawName, studentNameOrder);
+    }
+
+    const candidates = [
+      normalizeStudentName(rawName, 'given-first'),
+      normalizeStudentName(rawName, 'surname-first')
+    ];
+    const currentStudent = students.find(student =>
+      student.studentId.trim().toLocaleLowerCase() === studentId.trim().toLocaleLowerCase()
+    );
+    const existingNames = new Set(
+      students.map(student => normalizeStudentName(student.fullName).toLocaleLowerCase())
+    );
+    const namesToMatch = new Set(existingNames);
+    if (currentStudent) namesToMatch.add(normalizeStudentName(currentStudent.fullName).toLocaleLowerCase());
+
+    const matchingCandidates = candidates.filter(candidate =>
+      namesToMatch.has(candidate.toLocaleLowerCase())
+    );
+    return matchingCandidates.length === 1 ? matchingCandidates[0] : candidates[0];
+  };
 
   // Load rosters and categories
   const fetchData = async () => {
@@ -74,7 +147,13 @@ export default function StudentManager({ currentUserRole }: StudentManagerProps)
         fetch('/api/sections')
       ]);
 
-      if (studRes.ok) setStudents(await studRes.json());
+      if (studRes.ok) {
+        const fetchedStudents: Student[] = await studRes.json();
+        setStudents(fetchedStudents);
+        setViewedStudent(current =>
+          current ? fetchedStudents.find(student => student.studentId === current.studentId) || null : null
+        );
+      }
       if (deptRes.ok) setDepartments(await deptRes.json());
       if (progRes.ok) setPrograms(await progRes.json());
       if (secRes.ok) setSections(await secRes.json());
@@ -92,10 +171,11 @@ export default function StudentManager({ currentUserRole }: StudentManagerProps)
     const generateQRs = async () => {
       const cache: { [id: string]: string } = {};
       for (const s of students) {
-        if (!qrCache[s.studentId]) {
+        const qrIdentity = getQrIdentity(s);
+        if (!qrCache[qrIdentity]) {
           try {
             // Use high configuration formatting for printable badge standards
-            const qrData = await QRCode.toDataURL(s.studentId, {
+            const qrData = await QRCode.toDataURL(qrIdentity, {
               width: 250,
               margin: 2,
               color: {
@@ -103,7 +183,7 @@ export default function StudentManager({ currentUserRole }: StudentManagerProps)
                 light: '#ffffff'
               }
             });
-            cache[s.studentId] = qrData;
+            cache[qrIdentity] = qrData;
           } catch (err) {
             console.error('Failed generating QR base64 code for student ID', s.studentId, err);
           }
@@ -169,19 +249,39 @@ export default function StudentManager({ currentUserRole }: StudentManagerProps)
 
   // Inline update handler
   const handleUpdateStudent = async (id: string, updatedFields: Partial<Student>) => {
+    setErrorMessage(null);
     try {
-      const res = await fetch(`/api/students/${id}`, {
+      const res = await fetch(`/api/students/${encodeURIComponent(id)}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(updatedFields)
       });
-      if (!res.ok) throw new Error('Failed updating student metadata');
+      if (!res.ok) {
+        const error = await res.json();
+        throw new Error(error.error || 'Failed updating student metadata.');
+      }
       const updated = await res.json();
       setStudents(prev => prev.map(s => s.studentId === id ? updated : s));
+      setViewedStudent(current => current?.studentId === id ? updated : current);
       setEditingStudentId(null);
+      setEditingStudentDraft(null);
+      setSuccessMessage(`Updated student record for ${updated.fullName}.`);
     } catch (err) {
-      console.error(err);
+      setErrorMessage(err instanceof Error ? err.message : 'Failed updating student metadata.');
     }
+  };
+
+  const saveStudentEdit = () => {
+    if (!editingStudentId || !editingStudentDraft) return;
+    if (!editingStudentDraft.studentId.trim() || !editingStudentDraft.fullName.trim()) {
+      setErrorMessage('Student ID and name are required.');
+      return;
+    }
+    void handleUpdateStudent(editingStudentId, {
+      ...editingStudentDraft,
+      studentId: editingStudentDraft.studentId.trim(),
+      fullName: editingStudentDraft.fullName.trim()
+    });
   };
 
   // Delete handler
@@ -228,21 +328,63 @@ export default function StudentManager({ currentUserRole }: StudentManagerProps)
   };
 
   // Core Excel (CSV) Importer
-  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
+  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const input = e.currentTarget;
+    const file = input.files?.[0];
     if (!file) return;
 
-    const reader = new FileReader();
-    reader.onload = (event) => {
-      const text = event.target?.result as string;
-      setImportCsvInput(text);
-    };
-    reader.readAsText(file);
+    setErrorMessage(null);
+    try {
+      if (/\.(xlsx?|xlsm)$/i.test(file.name)) {
+        const workbook = XLSX.read(await file.arrayBuffer(), { type: 'array' });
+        const worksheets = workbook.SheetNames.map(name => {
+          const sheet = workbook.Sheets[name];
+          if (!sheet) throw new Error(`Worksheet "${name}" could not be read.`);
+          return { name, csv: XLSX.utils.sheet_to_csv(sheet) };
+        });
+        if (worksheets.length === 0) {
+          throw new Error('The selected Excel workbook does not contain a worksheet.');
+        }
+        setImportWorksheets(worksheets);
+        setSelectedImportWorksheet(worksheets[0].name);
+        setImportCsvInput(worksheets[0].csv);
+      } else {
+        setImportWorksheets([]);
+        setSelectedImportWorksheet('');
+        setImportCsvInput(await file.text());
+      }
+      setImportFileName(file.name);
+    } catch (err) {
+      setErrorMessage(err instanceof Error ? `Could not read the selected file: ${err.message}` : 'Could not read the selected file.');
+    } finally {
+      input.value = '';
+    }
   };
+
+  const importPreviewCandidates = importCsvInput
+    .split(/\r?\n/)
+    .filter(line => line.trim())
+    .map(parseCsvLine)
+    .filter(cells => cells[0] && cells[1]);
+  const firstPreviewRow = importPreviewCandidates[0] || [];
+  const previewHasHeader = firstPreviewRow.some(cell => {
+    const normalizedCell = cell.toLocaleLowerCase().replace(/[^a-z]/g, '');
+    return normalizedCell === 'studentid' || normalizedCell === 'fullname' || normalizedCell === 'studentnumber';
+  });
+  const importPreviewDataRows = importPreviewCandidates
+    .slice(previewHasHeader ? 1 : 0)
+    .map(cells => ({ id: cells[0], name: cells[1] }));
+  const matchingPreviewRows = importPreviewDataRows.filter(row =>
+    !importPreviewSearch.trim()
+    || row.id.toLocaleLowerCase().includes(importPreviewSearch.toLocaleLowerCase())
+    || row.name.toLocaleLowerCase().includes(importPreviewSearch.toLocaleLowerCase())
+  );
+  const importPreviewRows = matchingPreviewRows.slice(0, 6);
 
   const processImport = async () => {
     setErrorMessage(null);
     setSuccessMessage(null);
+    setIsImportModalOpen(false);
 
     if (!importCsvInput.trim()) {
       setErrorMessage('Please paste or upload a valid CSV list format.');
@@ -251,35 +393,11 @@ export default function StudentManager({ currentUserRole }: StudentManagerProps)
 
     // CSV Parse algorithm: splits lines, resolves quotations and escapes safely.
     const lines = importCsvInput.split(/\r?\n/);
-    const parsedStudents: Student[] = [];
-    const seenIdsInCsv = new Set<string>();
+    const parsedStudents = new Map<string, Student>();
+    const seenImportKeys = new Set<string>();
     let duplicateCsvCount = 0;
     let malformedOrEmptyCount = 0;
     let headerRowSkipped = false;
-
-    const parseCsvLine = (lineStr: string): string[] => {
-      const result: string[] = [];
-      let current = '';
-      let inQuotes = false;
-      for (let i = 0; i < lineStr.length; i++) {
-        const char = lineStr[i];
-        if (char === '"') {
-          if (inQuotes && lineStr[i + 1] === '"') {
-            current += '"';
-            i++;
-          } else {
-            inQuotes = !inQuotes;
-          }
-        } else if (char === ',' && !inQuotes) {
-          result.push(current.trim());
-          current = '';
-        } else {
-          current += char;
-        }
-      }
-      result.push(current.trim());
-      return result;
-    };
 
     // Robust header detection: check if first line is likely a header row
     let startIdx = 0;
@@ -332,15 +450,16 @@ export default function StudentManager({ currentUserRole }: StudentManagerProps)
         }
       }
 
-      if (seenIdsInCsv.has(studentId)) {
-        duplicateCsvCount++;
-      } else {
-        seenIdsInCsv.add(studentId);
-      }
+      const normalizedName = normalizeImportedStudentName(fullName, studentId);
+      const importKey = importMatchBy === 'fullName'
+        ? normalizedName.toLocaleLowerCase()
+        : studentId.toLocaleLowerCase();
+      if (seenImportKeys.has(importKey)) duplicateCsvCount++;
+      seenImportKeys.add(importKey);
 
-      parsedStudents.push({
+      parsedStudents.set(importKey, {
         studentId,
-        fullName,
+        fullName: normalizedName,
         department,
         program,
         yearLevel,
@@ -348,7 +467,7 @@ export default function StudentManager({ currentUserRole }: StudentManagerProps)
       });
     }
 
-    if (parsedStudents.length === 0) {
+    if (parsedStudents.size === 0) {
       setErrorMessage('Zero valid student records could be parsed. Check your data formats.');
       return;
     }
@@ -357,14 +476,26 @@ export default function StudentManager({ currentUserRole }: StudentManagerProps)
       const res = await fetch('/api/students/import', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ students: parsedStudents })
+        body: JSON.stringify({
+          students: Array.from(parsedStudents.values()),
+          matchBy: importMatchBy,
+          updateFields: updateExistingStudents ? importUpdateFields : [],
+          replaceExisting: updateExistingStudents
+        })
       });
 
-      if (!res.ok) throw new Error('Roster import processing failure on backend.');
+      if (!res.ok) {
+        const error = await res.json();
+        throw new Error(error.error || 'Roster import processing failure on backend.');
+      }
 
       const stats = await res.json();
       
-      let message = `Roster successfully imported! Added: ${stats.added} new records, Updated: ${stats.updated} existing records.`;
+      let message = `Roster successfully imported! Added: ${stats.added} new records, Updated: ${stats.updated} existing records, Skipped: ${stats.skipped || 0} existing records.`;
+      if (stats.ambiguous > 0) message += ` Ambiguous matches skipped: ${stats.ambiguous}.`;
+      if (stats.idUpdated > 0) {
+        message += ` Student IDs corrected for ${stats.idUpdated} students; existing QR badges and attendance reports are preserved.`;
+      }
       const skipNotes: string[] = [];
       if (headerRowSkipped) skipNotes.push('skipped 1 header row');
       if (duplicateCsvCount > 0) skipNotes.push(`resolved ${duplicateCsvCount} duplicate IDs inside the file`);
@@ -376,6 +507,10 @@ export default function StudentManager({ currentUserRole }: StudentManagerProps)
       
       setSuccessMessage(message);
       setImportCsvInput('');
+      setImportFileName('');
+      setImportWorksheets([]);
+      setSelectedImportWorksheet('');
+      setImportPreviewSearch('');
       setIsImportModalOpen(false);
       fetchData();
     } catch (err: any) {
@@ -417,11 +552,36 @@ export default function StudentManager({ currentUserRole }: StudentManagerProps)
     
     const matchesDept = filterDept === '' || s.department === filterDept;
     const matchesCourse = filterCourse === '' || s.program === filterCourse;
-    const matchesYear = filterYear === '' || s.yearLevel === filterYear;
+    const matchesYear = filterYear === '' || (filterYear === 'FREE' ? isFreeYear(s.yearLevel) : String(s.yearLevel).trim() === filterYear);
     const matchesSec = filterSec === '' ? true : (filterSec === 'FREE' ? ((s.section || '') === '' || (s.section || '').toUpperCase() === 'FREE') : s.section === filterSec);
 
     return matchesSearch && matchesDept && matchesCourse && matchesYear && matchesSec;
+  }).sort((a, b) => {
+    const compareText = (left: string, right: string) =>
+      left.localeCompare(right, undefined, { sensitivity: 'base', numeric: true });
+    const yearA = Number(a.yearLevel);
+    const yearB = Number(b.yearLevel);
+    const yearCompare = Number.isFinite(yearA) && Number.isFinite(yearB)
+      ? yearA - yearB
+      : compareText(a.yearLevel, b.yearLevel);
+
+    return compareText(a.department, b.department)
+      || compareText(a.program, b.program)
+      || yearCompare
+      || compareText(a.section || 'Free Section', b.section || 'Free Section')
+      || compareText(a.fullName, b.fullName)
+      || compareText(a.studentId, b.studentId);
   });
+
+  const getStudentGroupKey = (student: Student) =>
+    [student.department, student.program, student.yearLevel, student.section || ''].join('\u0000').toLocaleLowerCase();
+
+  const getStudentGroupLabel = (student: Student) => {
+    const year = /^\d+$/.test(student.yearLevel)
+      ? `${student.yearLevel}${Number(student.yearLevel) === 1 ? 'st' : Number(student.yearLevel) === 2 ? 'nd' : Number(student.yearLevel) === 3 ? 'rd' : 'th'} Year`
+      : student.yearLevel;
+    return `${student.department} · ${student.program} · ${year} · ${student.section ? `Section ${student.section}` : 'Free Section'}`;
+  };
 
   // Printer logic for 8 QR cards per A4 page in portrait PDF layout
   const handlePrintBadge = () => {
@@ -444,7 +604,7 @@ export default function StudentManager({ currentUserRole }: StudentManagerProps)
 
     const pagesHtml = studentChunks.map((chunk) => {
       const cardsHtml = chunk.map(s => {
-        const qrData = qrCache[s.studentId] || '';
+        const qrData = qrCache[getQrIdentity(s)] || '';
         return `
           <div class="qr-card">
             <div class="institution">CET Student QR Pass</div>
@@ -558,7 +718,6 @@ export default function StudentManager({ currentUserRole }: StudentManagerProps)
               box-sizing: border-box;
               background: white;
               position: relative;
-              overflow: hidden;
               height: 100%;
             }
             
@@ -590,11 +749,11 @@ export default function StudentManager({ currentUserRole }: StudentManagerProps)
               color: #0f172a;
               text-transform: uppercase;
               margin-top: 1px;
-              white-space: nowrap;
-              overflow: hidden;
-              text-overflow: ellipsis;
+              white-space: normal;
+              overflow-wrap: anywhere;
+              line-height: 1.2;
               width: 100%;
-              max-width: 170px;
+              max-width: 100%;
               padding: 0 4px;
             }
             
@@ -645,7 +804,7 @@ export default function StudentManager({ currentUserRole }: StudentManagerProps)
 
     const pagesHtml = studentChunks.map((chunk) => {
       const cardsHtml = chunk.map(s => {
-        const qrData = qrCache[s.studentId] || '';
+        const qrData = qrCache[getQrIdentity(s)] || '';
         return `
           <div class="qr-card">
             <div class="institution">CET Student QR Pass</div>
@@ -759,7 +918,6 @@ export default function StudentManager({ currentUserRole }: StudentManagerProps)
               box-sizing: border-box;
               background: white;
               position: relative;
-              overflow: hidden;
               height: 100%;
             }
             
@@ -791,11 +949,11 @@ export default function StudentManager({ currentUserRole }: StudentManagerProps)
               color: #0f172a;
               text-transform: uppercase;
               margin-top: 1px;
-              white-space: nowrap;
-              overflow: hidden;
-              text-overflow: ellipsis;
+              white-space: normal;
+              overflow-wrap: anywhere;
+              line-height: 1.2;
               width: 100%;
-              max-width: 170px;
+              max-width: 100%;
               padding: 0 4px;
             }
             
@@ -841,7 +999,7 @@ export default function StudentManager({ currentUserRole }: StudentManagerProps)
 
   // Download a single student badge card as a high-quality designed PNG image using HTML5 Canvas
   const downloadSingleCardImage = async (student: Student) => {
-    const qrDataUrl = qrCache[student.studentId];
+    const qrDataUrl = qrCache[getQrIdentity(student)];
     if (!qrDataUrl) return;
 
     const canvas = document.createElement('canvas');
@@ -876,17 +1034,39 @@ export default function StudentManager({ currentUserRole }: StudentManagerProps)
     // Draw QR code image (centered)
     ctx.drawImage(img, 90, 70, 180, 180);
 
-    // Draw Student Full Name
-    ctx.font = 'bold 20px sans-serif';
+    // Wrap the complete name so long names are not clipped on downloaded badges.
     ctx.fillStyle = '#0f172a';
     ctx.textAlign = 'center';
-    const nameUpper = student.fullName.toUpperCase();
-    ctx.fillText(nameUpper, 180, 295);
+    const nameWords = student.fullName.toUpperCase().split(/\s+/).filter(Boolean);
+    let nameFontSize = 18;
+    let nameLines: string[] = [];
+    while (nameFontSize >= 12) {
+      ctx.font = `bold ${nameFontSize}px sans-serif`;
+      nameLines = [];
+      let currentLine = '';
+      for (const word of nameWords) {
+        const candidate = currentLine ? `${currentLine} ${word}` : word;
+        if (currentLine && ctx.measureText(candidate).width > 320) {
+          nameLines.push(currentLine);
+          currentLine = word;
+        } else {
+          currentLine = candidate;
+        }
+      }
+      if (currentLine) nameLines.push(currentLine);
+      if (nameLines.length <= 3) break;
+      nameFontSize -= 2;
+    }
+    const nameLineHeight = nameFontSize + 3;
+    nameLines.forEach((line, index) => {
+      ctx.fillText(line, 180, 270 + nameLineHeight * (index + 1));
+    });
 
     // Draw Student ID
     ctx.font = 'bold 14px monospace';
     ctx.fillStyle = '#475569';
-    ctx.fillText(`ID: ${student.studentId}`, 180, 330);
+    const studentIdY = Math.max(330, 270 + nameLineHeight * (nameLines.length + 1));
+    ctx.fillText(`ID: ${student.studentId}`, 180, studentIdY);
 
     // Draw Program & Section details in a badge pill shape
     const pillText = `${student.program} • ${student.yearLevel}${student.section ? ` ${student.section}` : ' (No Section)'}`.toUpperCase();
@@ -896,7 +1076,7 @@ export default function StudentManager({ currentUserRole }: StudentManagerProps)
     const pillWidth = textWidth + 24;
     const pillHeight = 28;
     const pillX = 180 - pillWidth / 2;
-    const pillY = 365;
+    const pillY = Math.max(365, studentIdY + 35);
 
     // Light blue pill background
     ctx.fillStyle = '#eff6ff';
@@ -996,7 +1176,7 @@ export default function StudentManager({ currentUserRole }: StudentManagerProps)
       </div>
 
       {/* Filtering Widgets */}
-      <div className="bg-white border border-slate-200 rounded-xl p-4 shadow-sm grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-3.5">
+      <div className="bg-white border border-slate-200 rounded-xl p-4 shadow-sm grid grid-cols-1 sm:grid-cols-2 md:grid-cols-5 gap-3.5">
         <div className="relative">
           <span className="absolute inset-y-0 left-0 pl-3 flex items-center text-slate-400 pointer-events-none">
             <Search className="w-4 h-4 animate-pulse" />
@@ -1017,6 +1197,19 @@ export default function StudentManager({ currentUserRole }: StudentManagerProps)
               <X className="w-3.5 h-3.5" />
             </button>
           )}
+        </div>
+
+        <div>
+          <select
+            value={filterDept}
+            onChange={(e) => setFilterDept(e.target.value)}
+            className="w-full text-xs py-2 px-3 border border-slate-200 rounded-lg focus:outline-none focus:ring-1 focus:ring-blue-500 bg-white"
+          >
+            <option value="">All Colleges</option>
+            {departments.map(department => (
+              <option key={department.id} value={department.code}>{department.code}</option>
+            ))}
+          </select>
         </div>
 
         {/* Course select */}
@@ -1086,76 +1279,164 @@ export default function StudentManager({ currentUserRole }: StudentManagerProps)
               </thead>
               <tbody className="divide-y divide-slate-100 text-slate-700">
                 {filteredStudents.length > 0 ? (
-                  filteredStudents.map(student => {
+                  filteredStudents.map((student, index) => {
                     const isEditing = editingStudentId === student.studentId;
+                    const previousStudent = filteredStudents[index - 1];
                     return (
-                      <tr 
-                        key={student.studentId} 
-                        className={`hover:bg-blue-50/20 transition-colors cursor-pointer ${
-                          viewedStudent?.studentId === student.studentId ? 'bg-blue-50/50' : ''
-                        }`}
-                        onClick={() => !isEditing && setViewedStudent(student)}
-                      >
-                        <td className="p-4 font-semibold text-blue-900">{highlightMatch(student.studentId, searchQuery)}</td>
-                        <td className="p-4 font-semibold">
-                          {isEditing ? (
-                            <input
-                              type="text"
-                              defaultValue={student.fullName}
-                              onBlur={(e) => handleUpdateStudent(student.studentId, { fullName: e.target.value })}
-                              onKeyDown={(e) => {
-                                if (e.key === 'Enter') {
-                                  handleUpdateStudent(student.studentId, { fullName: (e.target as HTMLInputElement).value });
-                                }
-                              }}
-                              className="border px-2 py-1 rounded text-xs focus:ring-1 focus:ring-indigo-500"
-                              autoFocus
-                            />
-                          ) : (
-                            highlightMatch(student.fullName, searchQuery)
-                          )}
-                        </td>
-                        <td className="p-4 text-slate-500">{student.department}</td>
-                        <td className="p-4 text-slate-600 font-medium">
-                          {student.program} — {student.yearLevel}
-                        </td>
-                        <td className="p-4">
-                          <span className="bg-slate-100 border text-slate-600 px-2 py-0.5 rounded-md font-bold">
-                            {student.section || '—'}
-                          </span>
-                        </td>
-                        <td className="p-4 text-center">
-                          <button
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              setViewedStudent(student);
-                            }}
-                            className="inline-flex items-center gap-1.5 px-2.5 py-1 bg-slate-50 hover:bg-blue-50 text-blue-600 border border-slate-200 hover:border-blue-200 transition-colors rounded text-[10px] font-bold"
-                          >
-                            <Info className="w-3.5 h-3.5" /> View Badge
-                          </button>
-                        </td>
-                        {currentUserRole === 'admin' && (
-                          <td className="p-4 text-right" onClick={(e) => e.stopPropagation()}>
-                            <div className="inline-flex gap-1">
-                              <button
-                                onClick={() => setEditingStudentId(student.studentId)}
-                                className="p-1 text-slate-400 hover:text-blue-600 rounded hover:bg-slate-100 transition-colors"
-                                title="Edit Name"
-                              >
-                                <Edit3 className="w-4 h-4" />
-                              </button>
-                              <button
-                                onClick={() => handleDeleteStudent(student.studentId)}
-                                className="p-1 text-rose-400 hover:text-rose-600 rounded hover:bg-slate-100 transition-colors"
-                                title="Delete student"
-                              >
-                                <Trash2 className="w-4 h-4" />
-                              </button>
-                            </div>
-                          </td>
+                      <React.Fragment key={student.studentId}>
+                        {(!previousStudent || getStudentGroupKey(previousStudent) !== getStudentGroupKey(student)) && (
+                          <tr className="bg-slate-50 border-y border-slate-200">
+                            <td colSpan={currentUserRole === 'admin' ? 7 : 6} className="px-4 py-2 text-[11px] font-bold uppercase tracking-wide text-slate-600">
+                              {getStudentGroupLabel(student)}
+                            </td>
+                          </tr>
                         )}
-                      </tr>
+                        <tr
+                          className={`hover:bg-blue-50/20 transition-colors cursor-pointer ${
+                            viewedStudent?.studentId === student.studentId ? 'bg-blue-50/50' : ''
+                          }`}
+                          onClick={() => !isEditing && setViewedStudent(student)}
+                        >
+                          <td className="p-4 font-semibold text-blue-900">
+                            {isEditing && editingStudentDraft ? (
+                              <input
+                                type="text"
+                                value={editingStudentDraft.studentId}
+                                onChange={e => setEditingStudentDraft({ ...editingStudentDraft, studentId: e.target.value })}
+                                className="w-28 border px-2 py-1 rounded text-xs font-mono focus:ring-1 focus:ring-indigo-500"
+                                aria-label="Student ID"
+                              />
+                            ) : highlightMatch(student.studentId, searchQuery)}
+                          </td>
+                          <td className="p-4 font-semibold">
+                            {isEditing && editingStudentDraft ? (
+                              <input
+                                type="text"
+                                value={editingStudentDraft.fullName}
+                                onChange={e => setEditingStudentDraft({ ...editingStudentDraft, fullName: e.target.value })}
+                                className="border px-2 py-1 rounded text-xs focus:ring-1 focus:ring-indigo-500"
+                                aria-label="Full name"
+                              />
+                            ) : (
+                              highlightMatch(student.fullName, searchQuery)
+                            )}
+                          </td>
+                          <td className="p-4 text-slate-500">
+                            {isEditing && editingStudentDraft ? (
+                              <input
+                                type="text"
+                                value={editingStudentDraft.department}
+                                onChange={e => setEditingStudentDraft({ ...editingStudentDraft, department: e.target.value })}
+                                className="w-20 border px-2 py-1 rounded text-xs focus:ring-1 focus:ring-indigo-500"
+                                aria-label="College"
+                              />
+                            ) : student.department}
+                          </td>
+                          <td className="p-4 text-slate-600 font-medium">
+                            {isEditing && editingStudentDraft ? (
+                              <div className="flex flex-col gap-1">
+                                <input
+                                  type="text"
+                                  value={editingStudentDraft.program}
+                                  onChange={e => setEditingStudentDraft({ ...editingStudentDraft, program: e.target.value })}
+                                  className="w-24 border px-2 py-1 rounded text-xs focus:ring-1 focus:ring-indigo-500"
+                                  aria-label="Program"
+                                />
+                                <input
+                                  type="text"
+                                  value={editingStudentDraft.yearLevel}
+                                  onChange={e => setEditingStudentDraft({ ...editingStudentDraft, yearLevel: e.target.value })}
+                                  className="w-16 border px-2 py-1 rounded text-xs focus:ring-1 focus:ring-indigo-500"
+                                  aria-label="Year level"
+                                />
+                              </div>
+                            ) : `${student.program} — ${student.yearLevel}`}
+                          </td>
+                          <td className="p-4">
+                            {isEditing && editingStudentDraft ? (
+                              <input
+                                type="text"
+                                value={editingStudentDraft.section}
+                                onChange={e => setEditingStudentDraft({ ...editingStudentDraft, section: e.target.value })}
+                                className="w-14 border px-2 py-1 rounded text-xs focus:ring-1 focus:ring-indigo-500"
+                                aria-label="Section"
+                              />
+                            ) : (
+                              <span className="bg-slate-100 border text-slate-600 px-2 py-0.5 rounded-md font-bold">
+                                {student.section || '—'}
+                              </span>
+                            )}
+                          </td>
+                          <td className="p-4 text-center">
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setViewedStudent(student);
+                              }}
+                              className="inline-flex items-center gap-1.5 px-2.5 py-1 bg-slate-50 hover:bg-blue-50 text-blue-600 border border-slate-200 hover:border-blue-200 transition-colors rounded text-[10px] font-bold"
+                            >
+                              <Info className="w-3.5 h-3.5" /> View Badge
+                            </button>
+                          </td>
+                          {currentUserRole === 'admin' && (
+                            <td className="p-4 text-right" onClick={(e) => e.stopPropagation()}>
+                              <div className="inline-flex gap-1">
+                                {isEditing ? (
+                                  <>
+                                    <button
+                                      onClick={saveStudentEdit}
+                                      className="p-1 text-emerald-600 hover:text-emerald-700 rounded hover:bg-emerald-50 transition-colors"
+                                      title="Save student changes"
+                                      aria-label="Save student changes"
+                                    >
+                                      <Check className="w-4 h-4" />
+                                    </button>
+                                    <button
+                                      onClick={() => {
+                                        setEditingStudentId(null);
+                                        setEditingStudentDraft(null);
+                                      }}
+                                      className="p-1 text-slate-400 hover:text-slate-600 rounded hover:bg-slate-100 transition-colors"
+                                      title="Cancel editing"
+                                      aria-label="Cancel editing"
+                                    >
+                                      <X className="w-4 h-4" />
+                                    </button>
+                                  </>
+                                ) : (
+                                  <button
+                                    onClick={() => {
+                                      setEditingStudentId(student.studentId);
+                                      setEditingStudentDraft({
+                                        studentId: student.studentId,
+                                        fullName: student.fullName,
+                                        department: student.department,
+                                        program: student.program,
+                                        yearLevel: student.yearLevel,
+                                        section: student.section || ''
+                                      });
+                                      setErrorMessage(null);
+                                      setSuccessMessage(null);
+                                    }}
+                                    className="p-1 text-slate-400 hover:text-blue-600 rounded hover:bg-slate-100 transition-colors"
+                                    title="Edit student roster details"
+                                    aria-label="Edit student roster details"
+                                  >
+                                    <Edit3 className="w-4 h-4" />
+                                  </button>
+                                )}
+                                <button
+                                  onClick={() => handleDeleteStudent(student.studentId)}
+                                  className="p-1 text-rose-400 hover:text-rose-600 rounded hover:bg-slate-100 transition-colors"
+                                  title="Delete student"
+                                >
+                                  <Trash2 className="w-4 h-4" />
+                                </button>
+                              </div>
+                            </td>
+                          )}
+                        </tr>
+                      </React.Fragment>
                     );
                   })
                 ) : (
@@ -1190,9 +1471,9 @@ export default function StudentManager({ currentUserRole }: StudentManagerProps)
                     CET Student QR Pass
                   </div>
                   <div className="my-3">
-                    {qrCache[viewedStudent.studentId] ? (
+                    {qrCache[getQrIdentity(viewedStudent)] ? (
                       <img 
-                        src={qrCache[viewedStudent.studentId]} 
+                        src={qrCache[getQrIdentity(viewedStudent)]}
                         alt="Student QR Code" 
                         className="w-[180px] h-[180px] block mx-auto"
                       />
@@ -1202,7 +1483,7 @@ export default function StudentManager({ currentUserRole }: StudentManagerProps)
                       </div>
                     )}
                   </div>
-                  <h5 className="text-base font-bold text-slate-900 uppercase mt-1 w-full truncate px-1">
+                  <h5 className="text-base font-bold text-slate-900 uppercase mt-1 w-full whitespace-normal break-words px-1">
                     {viewedStudent.fullName}
                   </h5>
                   <p className="font-mono text-xs font-bold text-slate-600 mt-1">
@@ -1214,7 +1495,7 @@ export default function StudentManager({ currentUserRole }: StudentManagerProps)
                 </div>
 
                 <div className="grid grid-cols-2 gap-2 pt-4">
-                  {qrCache[viewedStudent.studentId] && (
+                  {qrCache[getQrIdentity(viewedStudent)] && (
                     <button
                       onClick={() => downloadSingleCardImage(viewedStudent)}
                       className="inline-flex items-center justify-center gap-1.5 py-2 text-xs font-semibold bg-white border border-slate-200 hover:border-emerald-300 text-slate-700 hover:text-emerald-600 transition shadow-sm rounded-lg cursor-pointer"
@@ -1301,6 +1582,8 @@ export default function StudentManager({ currentUserRole }: StudentManagerProps)
                                   text-transform: uppercase;
                                   margin-top: 4px;
                                   width: 100%;
+                                  overflow-wrap: anywhere;
+                                  line-height: 1.2;
                                 }
                                 .student-id {
                                   font-family: 'JetBrains Mono', monospace;
@@ -1330,7 +1613,7 @@ export default function StudentManager({ currentUserRole }: StudentManagerProps)
                               <div class="qr-card">
                                 <div class="institution">CET Student QR Pass</div>
                                 <div class="qr-wrapper">
-                                  <img src="${qrCache[viewedStudent.studentId]}" alt="QR Code" />
+                                  <img src="${qrCache[getQrIdentity(viewedStudent)]}" alt="QR Code" />
                                 </div>
                                 <div class="student-name">${viewedStudent.fullName}</div>
                                 <div class="student-id">ID: ${viewedStudent.studentId}</div>
@@ -1479,7 +1762,7 @@ export default function StudentManager({ currentUserRole }: StudentManagerProps)
       {/* MODAL: IMPORT EXCEL / CSV */}
       {isImportModalOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 backdrop-blur-xs p-4">
-          <div className="bg-white w-full max-w-lg rounded-2xl border shadow-xl overflow-hidden animate-in fade-in zoom-in-95 duration-150">
+          <div className="bg-white w-full max-w-lg max-h-[90vh] rounded-2xl border shadow-xl overflow-hidden animate-in fade-in zoom-in-95 duration-150 flex flex-col">
             <div className="flex items-center justify-between px-5 py-4 border-b">
               <h3 className="font-bold text-slate-900 text-md flex items-center gap-1.5">
                 <Upload className="w-5 h-5 text-indigo-500" />
@@ -1493,15 +1776,18 @@ export default function StudentManager({ currentUserRole }: StudentManagerProps)
               </button>
             </div>
 
-            <div className="p-5 space-y-4">
+            <div className="p-5 space-y-4 overflow-y-auto">
               <div className="text-xs text-slate-500 bg-slate-50 border border-slate-200 rounded-xl p-3.5 space-y-2">
-                <h5 className="font-bold text-slate-800">CSV Sheet Setup Instructions</h5>
-                <p>The institutional parser matches tabular CSV rows mapping columns exactly as shown:</p>
+                <h5 className="font-bold text-slate-800">Excel / CSV Sheet Setup Instructions</h5>
+                <p>Use these columns in this order, keeping each student's ID and name on the same row:</p>
                 <code className="block bg-white p-2 border rounded font-mono text-[10px] text-slate-600 select-all">
                   StudentId,FullName,Department,Program,YearLevel,Section<br />
                   2026-0001,Juan dela Cruz,CCS,BSIT,3,A<br />
                   2026-0002,Maria Santos,COE,BSGE,4,B
                 </code>
+                <p className="text-[10px] text-indigo-700 font-semibold">
+                  When sorting in Excel, select the entire table so student numbers remain paired with the correct names.
+                </p>
                 <p className="italic text-[10px] text-slate-400 mt-2">
                   * Year levels must represent indices (e.g. 1, 2, 3, 4). College departments codes match catalog settings.
                 </p>
@@ -1514,16 +1800,160 @@ export default function StudentManager({ currentUserRole }: StudentManagerProps)
               >
                 <Layers className="w-8 h-8 text-slate-400 mx-auto mb-2 animate-bounce" />
                 <p className="text-xs font-semibold text-slate-700">Click to brows files or drop target tables</p>
-                <p className="text-[10px] text-slate-450 mt-1">Accepts raw CSV exported tables directly (.csv or .txt)</p>
+                <p className="text-[10px] text-slate-450 mt-1">Accepts Excel workbooks (.xlsx, .xls) and CSV or TXT files</p>
                 
                 <input
                   type="file"
                   ref={fileInputRef}
-                  accept=".csv,.txt"
+                  accept=".xlsx,.xls,.xlsm,.csv,.txt"
                   onChange={handleFileUpload}
                   className="hidden"
                 />
               </div>
+
+              {importFileName && (
+                <div className="space-y-2 rounded-lg border border-slate-200 p-3">
+                  <p className="text-[10px] font-semibold text-slate-600">
+                    File loaded: <span className="font-bold">{importFileName}</span>
+                  </p>
+                  {importWorksheets.length > 1 && (
+                    <div>
+                      <label className="block text-[11px] font-bold text-slate-500 uppercase mb-1" htmlFor="import-worksheet">Worksheet to import</label>
+                      <select
+                        id="import-worksheet"
+                        value={selectedImportWorksheet}
+                        onChange={(e) => {
+                          const worksheet = importWorksheets.find(sheet => sheet.name === e.target.value);
+                          if (worksheet) {
+                            setSelectedImportWorksheet(worksheet.name);
+                            setImportCsvInput(worksheet.csv);
+                          }
+                        }}
+                        className="w-full text-xs py-2 px-3 border border-slate-200 rounded-lg bg-white"
+                      >
+                        {importWorksheets.map(sheet => (
+                          <option key={sheet.name} value={sheet.name}>{sheet.name}</option>
+                        ))}
+                      </select>
+                    </div>
+                  )}
+                  <p className="text-[10px] font-bold text-slate-600">
+                    Preview — exact Student ID and name values read from {selectedImportWorksheet ? `“${selectedImportWorksheet}”` : 'the file'}
+                  </p>
+                  <input
+                    type="search"
+                    value={importPreviewSearch}
+                    onChange={(e) => setImportPreviewSearch(e.target.value)}
+                    placeholder="Find a student by name or ID in the imported file"
+                    className="w-full text-xs py-2 px-3 border border-slate-200 rounded-lg"
+                  />
+                  <div className="max-h-36 overflow-auto rounded border border-slate-100">
+                    {importPreviewRows.length > 0 ? (
+                      <table className="w-full text-left text-[10px]">
+                        <thead className="sticky top-0 bg-slate-50 text-slate-500">
+                          <tr><th className="p-1.5">Student ID</th><th className="p-1.5">Name</th></tr>
+                        </thead>
+                        <tbody className="divide-y divide-slate-100">
+                          {importPreviewRows.map((row, index) => (
+                            <tr key={`${row.id}-${index}`}>
+                              <td className="p-1.5 font-mono">{row.id}</td>
+                              <td className="p-1.5">{row.name}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    ) : (
+                      <p className="p-2 text-[10px] text-slate-500">
+                        {importPreviewDataRows.length === 0 ? 'No student rows found in the loaded content.' : 'No rows match that search.'}
+                      </p>
+                    )}
+                  </div>
+                  {matchingPreviewRows.length > 6 && (
+                    <p className="text-[10px] text-slate-500">
+                      Showing 6 of {matchingPreviewRows.length} matching rows. Use the search above to verify any student before importing.
+                    </p>
+                  )}
+                </div>
+              )}
+
+              <div className="space-y-1.5">
+                <label className="block text-[11px] font-bold text-slate-500 uppercase" htmlFor="student-name-order">Name format in file</label>
+                <select
+                  id="student-name-order"
+                  value={studentNameOrder}
+                  onChange={(e) => setStudentNameOrder(e.target.value as StudentNameOrder)}
+                  className="w-full text-xs py-2 px-3 border border-slate-200 rounded-lg bg-white focus:outline-none focus:ring-1 focus:ring-indigo-500"
+                >
+                  <option value="auto">Auto-detect: Last, First Middle or First Middle Last</option>
+                  <option value="given-first">First Middle Last (no comma)</option>
+                  <option value="surname-first">Last First Middle (no comma)</option>
+                </select>
+                <p className="text-[10px] text-slate-500">
+                  Auto-detect checks each no-comma name against the existing roster, so a file may mix First Middle Last and Last First Middle rows. Commas explicitly mark Last, First Middle. Unmatched no-comma names default to First Middle Last; use another option if all unmatched rows use a different order.
+                </p>
+              </div>
+
+              <div className="space-y-2 rounded-lg border border-slate-200 p-3">
+                <label className="block text-[11px] font-bold text-slate-500 uppercase" htmlFor="student-match-field">Match existing students by</label>
+                <select
+                  id="student-match-field"
+                  value={importMatchBy}
+                  onChange={(e) => setImportMatchBy(e.target.value as 'studentId' | 'fullName')}
+                  className="w-full text-xs py-2 px-3 border border-slate-200 rounded-lg bg-white focus:outline-none focus:ring-1 focus:ring-indigo-500"
+                >
+                  <option value="studentId" disabled={importUpdateFields.includes('studentId')}>Student ID</option>
+                  <option value="fullName" disabled={importUpdateFields.includes('fullName')}>Name (Last, First Middle)</option>
+                </select>
+                <p className="text-[10px] text-slate-500">
+                  {importMatchBy === 'fullName'
+                  ? 'Use this to correct student IDs from a roster matched by name. Names must match a single existing student.'
+                    : 'Use this to correct a name or other details while keeping each student ID as the match key.'}
+                </p>
+              </div>
+
+              <fieldset className="space-y-2 rounded-lg border border-slate-200 p-3">
+                <legend className="px-1 text-[11px] font-bold text-slate-500 uppercase">Fields to update from file</legend>
+                <div className="grid grid-cols-2 gap-2">
+                  {([
+                    ['studentId', 'Student ID'],
+                    ['fullName', 'Name'],
+                    ['department', 'College'],
+                    ['program', 'Program'],
+                    ['yearLevel', 'Year'],
+                    ['section', 'Section']
+                  ] as const).map(([field, label]) => (
+                    <label key={field} className="flex items-center gap-2 text-xs text-slate-700">
+                      <input
+                        type="checkbox"
+                        checked={importUpdateFields.includes(field)}
+                        onChange={(e) => {
+                          const checked = e.target.checked;
+                          if (checked && field === 'studentId') {
+                            setImportUpdateFields(current => [...current.filter(selectedField => selectedField !== 'fullName'), field]);
+                            setImportMatchBy('fullName');
+                          } else if (checked && field === 'fullName') {
+                            setImportUpdateFields(current => [...current.filter(selectedField => selectedField !== 'studentId'), field]);
+                            setImportMatchBy('studentId');
+                          } else {
+                            setImportUpdateFields(current =>
+                              checked
+                                ? [...current, field]
+                                : current.filter(selectedField => selectedField !== field)
+                            );
+                          }
+                        }}
+                        className="accent-indigo-600"
+                      />
+                      {label}
+                    </label>
+                  ))}
+                </div>
+                {importUpdateFields.includes('studentId') && (
+                  <p className="text-[10px] font-medium text-amber-700">
+                    IDs will be matched to students by name automatically. Student names must match the existing roster. QR badges and attendance reports stay linked.
+                  </p>
+                )}
+              </fieldset>
 
               <div className="space-y-1.5">
                 <label className="block text-[11px] font-bold text-slate-500 uppercase">Or Paste comma-separated text</label>
@@ -1531,10 +1961,29 @@ export default function StudentManager({ currentUserRole }: StudentManagerProps)
                   rows={4}
                   placeholder="2026-0003,Pedro Penduko,COA,BSA,2,D"
                   value={importCsvInput}
-                  onChange={(e) => setImportCsvInput(e.target.value)}
+                  onChange={(e) => {
+                    setImportCsvInput(e.target.value);
+                    setImportFileName('');
+                    setImportWorksheets([]);
+                    setSelectedImportWorksheet('');
+                    setImportPreviewSearch('');
+                  }}
                   className="w-full text-xs font-mono p-3 border border-slate-200 rounded-lg focus:outline-none focus:ring-1 focus:ring-indigo-500"
                 />
               </div>
+
+              <label className="flex items-start gap-2.5 rounded-lg border border-indigo-100 bg-indigo-50/60 p-3 text-xs text-slate-700 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={updateExistingStudents}
+                  onChange={(e) => setUpdateExistingStudents(e.target.checked)}
+                  className="mt-0.5 accent-indigo-600"
+                />
+                <span>
+                  <strong className="block text-slate-800">Update matched students</strong>
+                  When unchecked, existing students are left unchanged. New student IDs are always added.
+                </span>
+              </label>
 
               <div className="flex gap-2 justify-end pt-4 border-t">
                 <button
@@ -1549,7 +1998,7 @@ export default function StudentManager({ currentUserRole }: StudentManagerProps)
                   onClick={processImport}
                   className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-xs font-semibold cursor-pointer"
                 >
-                  Trigger Import
+                  Submit Roster
                 </button>
               </div>
             </div>

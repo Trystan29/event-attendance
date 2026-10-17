@@ -5,6 +5,7 @@
 
 import fs from 'fs';
 import path from 'path';
+import { randomUUID } from 'crypto';
 import { db } from "../src/db/index.ts";
 import { 
   users as usersTable, 
@@ -15,7 +16,7 @@ import {
   events as eventsTable, 
   attendance as attendanceTable 
 } from "../src/db/schema.ts";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { csvStudents } from './csvSeedData.ts';
 import { buildConsolidatedAttendance } from './csvImporter.ts';
 import { 
@@ -27,6 +28,7 @@ import {
   Event, 
   AttendanceRecord 
 } from '../src/types.ts';
+import { normalizeStudentName } from '../src/utils/studentName.ts';
 
 const DB_DIR = path.join(process.cwd(), 'data');
 const DB_FILE = path.join(DB_DIR, 'db.json');
@@ -83,6 +85,97 @@ const DEFAULT_DB: DatabaseSchema = {
   activeScanMode: 'in'
 };
 
+const studentNameTokens = (name: string) =>
+  normalizeStudentName(name)
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLocaleLowerCase()
+    .match(/[a-z0-9]+/g) || [];
+
+const hasOneCharacterDifference = (left: string, right: string) => {
+  if (Math.abs(left.length - right.length) > 1) return false;
+
+  let leftIndex = 0;
+  let rightIndex = 0;
+  let differences = 0;
+
+  while (leftIndex < left.length && rightIndex < right.length) {
+    if (left[leftIndex] === right[rightIndex]) {
+      leftIndex++;
+      rightIndex++;
+      continue;
+    }
+
+    differences++;
+    if (differences > 1) return false;
+    if (left.length > right.length) leftIndex++;
+    else if (right.length > left.length) rightIndex++;
+    else {
+      leftIndex++;
+      rightIndex++;
+    }
+  }
+
+  if (leftIndex < left.length || rightIndex < right.length) differences++;
+  return differences === 1;
+};
+
+const studentNamesMatch = (leftName: string, rightName: string) => {
+  const leftTokens = studentNameTokens(leftName);
+  const rightTokens = studentNameTokens(rightName);
+  if (leftTokens.length !== rightTokens.length) return false;
+
+  const findMatch = (leftIndex: number, usedRightTokens: Set<number>, usedTypo: boolean): boolean => {
+    if (leftIndex === leftTokens.length) return true;
+
+    const leftToken = leftTokens[leftIndex];
+    for (let rightIndex = 0; rightIndex < rightTokens.length; rightIndex++) {
+      if (usedRightTokens.has(rightIndex)) continue;
+      const rightToken = rightTokens[rightIndex];
+      const isExact = leftToken === rightToken;
+      const isInitial = Math.min(leftToken.length, rightToken.length) === 1
+        && (leftToken.startsWith(rightToken) || rightToken.startsWith(leftToken));
+      const isSingleTypo = !usedTypo && hasOneCharacterDifference(leftToken, rightToken);
+      if (!isExact && !isInitial && !isSingleTypo) continue;
+
+      usedRightTokens.add(rightIndex);
+      if (findMatch(leftIndex + 1, usedRightTokens, usedTypo || (!isExact && !isInitial))) return true;
+      usedRightTokens.delete(rightIndex);
+    }
+
+    return false;
+  };
+
+  return leftTokens.length > 0 && findMatch(0, new Set<number>(), false);
+};
+
+const studentNameExpandsInitials = (abbreviatedName: string, fullName: string) => {
+  const abbreviatedTokens = studentNameTokens(abbreviatedName);
+  const fullTokens = studentNameTokens(fullName);
+  if (abbreviatedTokens.length !== fullTokens.length) return false;
+
+  const matchTokens = (index: number, usedTokens: Set<number>, expandedInitial: boolean): boolean => {
+    if (index === abbreviatedTokens.length) return expandedInitial;
+
+    const token = abbreviatedTokens[index];
+    for (let candidateIndex = 0; candidateIndex < fullTokens.length; candidateIndex++) {
+      if (usedTokens.has(candidateIndex)) continue;
+      const candidate = fullTokens[candidateIndex];
+      const isExact = token === candidate;
+      const isInitialExpansion = token.length === 1 && candidate.startsWith(token);
+      if (!isExact && !isInitialExpansion) continue;
+
+      usedTokens.add(candidateIndex);
+      if (matchTokens(index + 1, usedTokens, expandedInitial || isInitialExpansion)) return true;
+      usedTokens.delete(candidateIndex);
+    }
+
+    return false;
+  };
+
+  return abbreviatedTokens.length > 0 && matchTokens(0, new Set<number>(), false);
+};
+
 async function safeDbWrite(operation: () => Promise<any>, description: string) {
   try {
     await operation();
@@ -98,6 +191,31 @@ export class JSONDatabase {
   constructor() {
     this.data = { ...DEFAULT_DB };
     this.loadLocalBackup();
+    this.normalizeStoredStudentNames();
+  }
+
+  private normalizeStoredStudentNames(): Student[] {
+    const changedStudents: Student[] = [];
+    this.data.students = this.data.students.map(student => {
+      const storedName = normalizeStudentName(student.fullName);
+      const historicalNames = [...new Set(
+        this.data.attendance
+          .filter(record => record.studentId === student.studentId && record.studentName)
+          .map(record => normalizeStudentName(record.studentName))
+          .filter(name => studentNameExpandsInitials(storedName, name))
+      )];
+      const recoveredName = historicalNames.length === 1 ? historicalNames[0] : storedName;
+      const fullName = normalizeStudentName(recoveredName);
+      const qrCodeId = student.qrCodeId || student.studentId;
+      if (fullName !== student.fullName || qrCodeId !== student.qrCodeId) {
+        const updatedStudent = { ...student, fullName, qrCodeId };
+        changedStudents.push(updatedStudent);
+        return updatedStudent;
+      }
+      return student;
+    });
+    if (changedStudents.length > 0) this.save();
+    return changedStudents;
   }
 
   private loadLocalBackup() {
@@ -157,6 +275,8 @@ export class JSONDatabase {
   async initialize(): Promise<void> {
     console.log('[SQL] Initializing database and pre-loading cache from PostgreSQL...');
     try {
+      await db.execute(sql`ALTER TABLE students ADD COLUMN IF NOT EXISTS qr_code_id text`);
+      await db.execute(sql`UPDATE students SET qr_code_id = student_id WHERE qr_code_id IS NULL OR qr_code_id = ''`);
       const sqlUsers = await db.select().from(usersTable);
       
       if (sqlUsers.length === 0) {
@@ -216,6 +336,16 @@ export class JSONDatabase {
             timeOut: a.timeOut || null
           })) as AttendanceRecord[]
         };
+        const normalizedStudents = this.normalizeStoredStudentNames();
+        if (normalizedStudents.length > 0) {
+          await safeDbWrite(async () => {
+            for (const student of normalizedStudents) {
+              await db.update(studentsTable)
+                .set({ fullName: student.fullName, qrCodeId: student.qrCodeId })
+                .where(eq(studentsTable.studentId, student.studentId));
+            }
+          }, `normalize names for ${normalizedStudents.length} students`);
+        }
         console.log(`[SQL] Successfully pre-loaded:`);
         console.log(`      - ${this.data.users.length} users`);
         console.log(`      - ${this.data.students.length} students`);
@@ -298,11 +428,19 @@ export class JSONDatabase {
     return this.data.students.find(s => s.studentId && s.studentId.trim().toLowerCase() === target);
   }
 
+  getStudentByQRCodeId(qrCodeId: string): Student | undefined {
+    if (!qrCodeId) return undefined;
+    const target = qrCodeId.trim().toLocaleLowerCase();
+    return this.data.students.find(student => (student.qrCodeId || student.studentId).trim().toLocaleLowerCase() === target);
+  }
+
   addStudent(student: Student): Student {
     this.data.students = this.data.students.filter(s => s.studentId !== student.studentId);
     
     const newStudent: Student = {
       ...student,
+      qrCodeId: student.qrCodeId || randomUUID(),
+      fullName: normalizeStudentName(student.fullName),
       createdAt: student.createdAt || new Date().toISOString()
     };
     this.data.students.push(newStudent);
@@ -314,6 +452,7 @@ export class JSONDatabase {
         .onConflictDoUpdate({
           target: studentsTable.studentId,
           set: {
+            qrCodeId: newStudent.qrCodeId,
             fullName: newStudent.fullName,
             department: newStudent.department,
             program: newStudent.program,
@@ -327,68 +466,170 @@ export class JSONDatabase {
     return newStudent;
   }
 
-  addStudentsBatch(students: Student[]): { added: number; updated: number } {
+  addStudentsBatch(
+    students: Student[],
+    options: {
+      matchBy?: 'studentId' | 'fullName';
+      updateFields?: Array<'studentId' | 'fullName' | 'department' | 'program' | 'yearLevel' | 'section'>;
+      replaceExisting?: boolean;
+    } = {}
+  ): { added: number; updated: number; skipped: number; ambiguous: number; idUpdated: number } {
+    const matchBy = options.matchBy || 'studentId';
+    const updateFields = options.replaceExisting === false
+      ? []
+      : options.updateFields || ['fullName', 'department', 'program', 'yearLevel', 'section'];
     let added = 0;
     let updated = 0;
-    const batchList: Student[] = [];
+    let skipped = 0;
+    let ambiguous = 0;
+    const originalStudents = [...this.data.students];
+    const updates: Array<{ previous: Student; student: Student }> = [];
+    const additions: Student[] = [];
+    const usedMatches = new Set<string>();
+    const allowedFields = new Set(['studentId', 'fullName', 'department', 'program', 'yearLevel', 'section']);
 
-    students.forEach(s => {
-      this.ensureSystemSetupEntities(s.program, s.section, s.department);
-      const exists = this.getStudentById(s.studentId);
-      if (exists) {
-        updated++;
-      } else {
-        added++;
-      }
-      
-      this.data.students = this.data.students.filter(stud => stud.studentId !== s.studentId);
-      const newStudent: Student = {
-        ...s,
-        createdAt: s.createdAt || new Date().toISOString()
+    for (const importedStudent of students) {
+      const incoming = {
+        ...importedStudent,
+        studentId: String(importedStudent.studentId).trim(),
+        fullName: normalizeStudentName(importedStudent.fullName)
       };
-      this.data.students.push(newStudent);
-      batchList.push(newStudent);
-    });
+      let matches = matchBy === 'studentId'
+        ? originalStudents.filter(student => student.studentId.trim().toLocaleLowerCase() === incoming.studentId.toLocaleLowerCase())
+        : originalStudents.filter(student => studentNamesMatch(student.fullName, incoming.fullName));
 
+      if (matches.length > 1 || (matches.length === 1 && usedMatches.has(matches[0].studentId))) {
+        ambiguous++;
+        continue;
+      }
+
+      const existingStudent = matches[0];
+      if (!existingStudent) {
+        if (matchBy === 'fullName' && updateFields.includes('studentId')) {
+          skipped++;
+          continue;
+        }
+        additions.push({
+          ...incoming,
+          qrCodeId: randomUUID(),
+          createdAt: incoming.createdAt || new Date().toISOString()
+        });
+        added++;
+        continue;
+      }
+
+      usedMatches.add(existingStudent.studentId);
+      if (updateFields.length === 0) {
+        skipped++;
+        continue;
+      }
+
+      const nextStudent: Student = { ...existingStudent };
+      for (const field of updateFields) {
+        if (!allowedFields.has(field)) continue;
+        if (field === 'studentId') nextStudent.studentId = incoming.studentId;
+        else if (field === 'fullName') nextStudent.fullName = incoming.fullName;
+        else if (field === 'department') nextStudent.department = incoming.department;
+        else if (field === 'program') nextStudent.program = incoming.program;
+        else if (field === 'yearLevel') nextStudent.yearLevel = incoming.yearLevel;
+        else if (field === 'section') nextStudent.section = incoming.section;
+      }
+
+      if (Object.keys(nextStudent).every(key => nextStudent[key as keyof Student] === existingStudent[key as keyof Student])) {
+        skipped++;
+        continue;
+      }
+
+      updates.push({ previous: existingStudent, student: nextStudent });
+      updated++;
+    }
+
+    const updatedByOriginalId = new Map(updates.map(({ previous, student }) => [previous.studentId, student]));
+    const finalStudents = originalStudents.map(student => updatedByOriginalId.get(student.studentId) || student);
+    finalStudents.push(...additions);
+    const studentIds = new Map<string, Student>();
+    for (const student of finalStudents) {
+      const normalizedId = student.studentId.trim().toLocaleLowerCase();
+      const existingWithId = studentIds.get(normalizedId);
+      if (!normalizedId || existingWithId) {
+        const conflict = existingWithId
+          ? `Student ID "${student.studentId}" is still assigned to "${existingWithId.fullName}" in the existing roster, and the import also assigns it to "${student.fullName}". Their imported name may not match the roster, so the current student was not recognized for an ID change. Check the name spelling and selected match field.`
+          : `A student has an empty student ID (${student.fullName}).`;
+        throw new Error(`${conflict} Check the source roster and selected match field. No changes were applied.`);
+      }
+      studentIds.set(normalizedId, student);
+    }
+
+    for (const { student } of updates) {
+      this.ensureSystemSetupEntities(student.program, student.section, student.department);
+    }
+    for (const student of additions) {
+      this.ensureSystemSetupEntities(student.program, student.section, student.department);
+    }
+    const idChanges = updates.filter(({ previous, student }) => previous.studentId !== student.studentId);
+    if (idChanges.length > 0) {
+      const idMap = new Map(idChanges.map(({ previous, student }) => [previous.studentId, student.studentId]));
+      this.data.attendance = this.data.attendance.map(record => {
+        const studentId = idMap.get(record.studentId);
+        return studentId ? { ...record, studentId } : record;
+      });
+    }
+    this.data.students = finalStudents;
     this.save();
 
-    safeDbWrite(async () => {
-      for (const s of batchList) {
-        await db.insert(studentsTable)
-          .values(s)
-          .onConflictDoUpdate({
-            target: studentsTable.studentId,
-            set: {
-              fullName: s.fullName,
-              department: s.department,
-              program: s.program,
-              yearLevel: s.yearLevel,
-              section: s.section,
-              createdAt: s.createdAt
-            }
-          });
-      }
-    }, `batch insert/update ${batchList.length} students`);
+    if (updates.length > 0 || additions.length > 0) {
+      safeDbWrite(async () => {
+        await db.transaction(async tx => {
+          const temporaryAttendanceIds = idChanges.map(({ previous }, index) => ({
+            previousId: previous.studentId,
+            temporaryId: `__student_import_${randomUUID()}_${index}__`
+          }));
 
-    return { added, updated };
+          for (const { previousId, temporaryId } of temporaryAttendanceIds) {
+            await tx.update(attendanceTable).set({ studentId: temporaryId }).where(eq(attendanceTable.studentId, previousId));
+          }
+          for (const { previous } of idChanges) {
+            await tx.delete(studentsTable).where(eq(studentsTable.studentId, previous.studentId));
+          }
+          for (const { previous, student } of updates) {
+            if (previous.studentId !== student.studentId) {
+              await tx.insert(studentsTable).values(student);
+            } else {
+              await tx.update(studentsTable).set(student).where(eq(studentsTable.studentId, previous.studentId));
+            }
+          }
+          for (const student of additions) {
+            await tx.insert(studentsTable).values(student);
+          }
+          for (let index = 0; index < temporaryAttendanceIds.length; index++) {
+            const { temporaryId } = temporaryAttendanceIds[index];
+            await tx.update(attendanceTable)
+              .set({ studentId: idChanges[index].student.studentId })
+              .where(eq(attendanceTable.studentId, temporaryId));
+          }
+        });
+      }, `batch import ${added} students, update ${updated}, skip ${skipped}`);
+    }
+
+    return { added, updated, skipped, ambiguous, idUpdated: idChanges.length };
   }
 
   updateStudent(studentId: string, updatedFields: Partial<Student>): Student | undefined {
-    const sIndex = this.data.students.findIndex(s => s.studentId === studentId);
-    if (sIndex === -1) return undefined;
+    const existingStudent = this.data.students.find(student => student.studentId === studentId);
+    if (!existingStudent) return undefined;
 
-    this.data.students[sIndex] = {
-      ...this.data.students[sIndex],
+    const nextStudent = {
+      ...existingStudent,
       ...updatedFields,
-      studentId
+      studentId: updatedFields.studentId === undefined ? studentId : String(updatedFields.studentId).trim(),
+      ...(updatedFields.fullName !== undefined ? { fullName: normalizeStudentName(updatedFields.fullName) } : {})
     };
-    this.save();
+    this.addStudentsBatch([nextStudent], {
+      matchBy: 'studentId',
+      updateFields: ['studentId', 'fullName', 'department', 'program', 'yearLevel', 'section']
+    });
 
-    safeDbWrite(async () => {
-      await db.update(studentsTable).set(updatedFields).where(eq(studentsTable.studentId, studentId));
-    }, `update student ${studentId}`);
-
-    return this.data.students[sIndex];
+    return this.data.students.find(student => student.studentId === nextStudent.studentId);
   }
 
   deleteStudent(studentId: string): boolean {
@@ -642,7 +883,7 @@ export class JSONDatabase {
     scannerUsername: string,
     scanType: 'in' | 'out' = 'in'
   ): { success: boolean; message: string; type?: 'in' | 'out'; record?: AttendanceRecord; student?: Student } {
-    const student = this.getStudentById(studentId);
+    const student = this.getStudentByQRCodeId(studentId) || this.getStudentById(studentId);
     if (!student) {
       return { success: false, message: `Student ID "${studentId}" is not registered in the system.` };
     }

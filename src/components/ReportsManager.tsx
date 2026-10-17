@@ -78,7 +78,10 @@ export default function ReportsManager({ currentUsername }: ReportsManagerProps)
   const [programs, setPrograms] = useState<Program[]>([]);
   const [sections, setSections] = useState<Section[]>([]);
   const [students, setStudents] = useState<Student[]>([]);
-  const filteredSections = sections.filter(s => s.name.toUpperCase() !== 'E');
+  const filteredSections = sections.filter(s => {
+    const n = s.name.trim().toUpperCase();
+    return n !== 'E' && n !== 'FREE';
+  });
   const [loading, setLoading] = useState(true);
 
   // Sub tab view switcher: logs chronological tab vs summary matrix tab
@@ -417,6 +420,7 @@ export default function ReportsManager({ currentUsername }: ReportsManagerProps)
   const handleQuickDownload = () => {
     if (!quickEventId || !quickEventDate) return;
     const params = new URLSearchParams();
+    params.append('mode', 'summary');
     params.append('event', quickEventId);
     params.append('date', quickEventDate);
     const cached = localStorage.getItem('qr_attend_session');
@@ -668,9 +672,9 @@ export default function ReportsManager({ currentUsername }: ReportsManagerProps)
           <div className="inline-flex items-center gap-2 px-2.5 py-1 bg-emerald-100 text-emerald-800 rounded-full font-bold text-[10px] tracking-wide uppercase select-none">
             <FileSpreadsheet className="w-3.5 h-3.5" /> Organized Event Downloader
           </div>
-          <h3 className="text-base font-extrabold text-slate-900 font-display">Event-Specific Attendance Download</h3>
+          <h3 className="text-base font-extrabold text-slate-900 font-display">Event-Specific Summary Download</h3>
           <p className="text-xs text-slate-600 leading-relaxed">
-            Quickly export a focused, organized MS Excel-compatible spreadsheet for a specific event on a specific date. This isolates only the selected event's logs for tidy records.
+            Export a student summary for one event and date, including each student's attendance status and total sanction time.
           </p>
           
           {/* Quick Click Event Markers Shortcuts */}
@@ -745,7 +749,7 @@ export default function ReportsManager({ currentUsername }: ReportsManagerProps)
                   : 'bg-emerald-600 hover:bg-emerald-700 text-white hover:shadow-md'
               }`}
             >
-              <Download className="w-4 h-4" /> Download Event Excel
+              <Download className="w-4 h-4" /> Download Event Summary
             </button>
           </div>
         </div>

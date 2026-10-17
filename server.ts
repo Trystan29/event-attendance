@@ -433,6 +433,24 @@ async function startServer() {
     if (!Array.isArray(students)) {
       return res.status(400).json({ error: 'Expected students field as structured array' });
     }
+    const matchBy = req.body.matchBy;
+    if (matchBy !== undefined && matchBy !== 'studentId' && matchBy !== 'fullName') {
+      return res.status(400).json({ error: 'Match existing students by studentId or fullName.' });
+    }
+    const allowedUpdateFields = ['studentId', 'fullName', 'department', 'program', 'yearLevel', 'section'];
+    const requestedUpdateFields = req.body.updateFields;
+    if (requestedUpdateFields !== undefined && (
+      !Array.isArray(requestedUpdateFields) ||
+      requestedUpdateFields.some((field: unknown) => typeof field !== 'string' || !allowedUpdateFields.includes(field))
+    )) {
+      return res.status(400).json({ error: 'One or more selected student fields cannot be updated.' });
+    }
+    const fieldsToUpdate = Array.isArray(requestedUpdateFields) ? requestedUpdateFields : [];
+    if (fieldsToUpdate.includes(matchBy || 'studentId')) {
+      return res.status(400).json({
+        error: `Choose a different matching field before updating ${matchBy === 'fullName' ? 'names' : 'student IDs'}.`
+      });
+    }
     
     // Filter and normalize
     const validStudents = students.filter(s => {
@@ -450,19 +468,31 @@ async function startServer() {
       return res.status(400).json({ error: 'No valid student records found in payload.' });
     }
 
-    const { added, updated } = db.addStudentsBatch(validStudents);
-    broadcastStats();
-    res.json({ message: `Successfully parsed student rosters format.`, added, updated });
+    try {
+      const { added, updated, skipped, ambiguous, idUpdated } = db.addStudentsBatch(validStudents, {
+        matchBy: matchBy || 'studentId',
+        updateFields: requestedUpdateFields,
+        replaceExisting: req.body.replaceExisting
+      });
+      broadcastStats();
+      res.json({ message: `Successfully parsed student rosters format.`, added, updated, skipped, ambiguous, idUpdated });
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Student import could not be applied.' });
+    }
   });
 
   app.put('/api/students/:id', authenticate, requireAdmin, (req, res) => {
     const studentId = req.params.id;
-    const result = db.updateStudent(studentId, req.body);
-    if (!result) {
-      return res.status(404).json({ error: 'Student not found in institutional rosters' });
+    try {
+      const result = db.updateStudent(studentId, req.body);
+      if (!result) {
+        return res.status(404).json({ error: 'Student not found in institutional rosters' });
+      }
+      broadcastStats();
+      res.json(result);
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Student update could not be applied.' });
     }
-    broadcastStats();
-    res.json(result);
   });
 
   app.delete('/api/students', authenticate, requireAdmin, (req, res) => {
@@ -678,19 +708,6 @@ async function startServer() {
     const allLogs = db.getAttendance();
     const isSummaryMode = mode === 'summary';
 
-    const getSessionType = (timeInStr: any): 'AM' | 'PM' => {
-      if (!timeInStr) return 'AM';
-      const str = String(timeInStr).toUpperCase();
-      if (str.includes('PM')) return 'PM';
-      if (str.includes('AM')) return 'AM';
-      const match = str.match(/^(\d+):/);
-      if (match) {
-        const hr = parseInt(match[1], 10);
-        if (hr >= 12) return 'PM';
-      }
-      return 'AM';
-    };
-
     // Build SheetJS Excel workbook
     const wb = xlsx.utils.book_new();
 
@@ -723,73 +740,53 @@ async function startServer() {
         }
       }
 
-      // 2. Compute the exact same global ordered list of event slots (AM vs PM) as the UI
-      interface Slot {
+      // 2. Build one report column for each event date.
+      interface EventDateColumn {
         eventId: string;
         eventName: string;
         date: string;
-        session: 'AM' | 'PM';
-        key: string;
       }
       const eventsList = db.getEvents();
-      const dynamicSlotsList: Slot[] = [];
+      const eventDateColumns: EventDateColumn[] = [];
       const seenKeys = new Set<string>();
 
-      // Active Logs Slots
+      // Include events found in attendance logs, even if they are no longer scheduled.
       allLogs.forEach(log => {
-        const session = getSessionType(log.timeIn);
-        const key = `${log.eventId}_${log.date}_${session}`;
+        const key = `${log.eventId}_${log.date}`;
         if (!seenKeys.has(key)) {
           seenKeys.add(key);
-          dynamicSlotsList.push({
+          eventDateColumns.push({
             eventId: log.eventId,
             eventName: log.eventName,
-            date: log.date,
-            session,
-            key
+            date: log.date
           });
         }
       });
 
-      // Scheduled Events Slots
+      // Include scheduled event dates even when nobody attended.
       eventsList.forEach(ev => {
         if (ev.date) {
-          const keyAM = `${ev.id}_${ev.date}_AM`;
-          if (!seenKeys.has(keyAM)) {
-            seenKeys.add(keyAM);
-            dynamicSlotsList.push({
+          const key = `${ev.id}_${ev.date}`;
+          if (!seenKeys.has(key)) {
+            seenKeys.add(key);
+            eventDateColumns.push({
               eventId: ev.id,
               eventName: ev.name,
-              date: ev.date,
-              session: 'AM',
-              key: keyAM
+              date: ev.date
             });
-          }
-          const isMultiSession = ev.name.toLowerCase().includes('intramural') || 
-                                 ev.name.toLowerCase().includes('sports') || 
-                                 ev.name.toLowerCase().includes('fest') ||
-                                 ev.name.toLowerCase().includes('athletic');
-          if (isMultiSession) {
-            const keyPM = `${ev.id}_${ev.date}_PM`;
-            if (!seenKeys.has(keyPM)) {
-              seenKeys.add(keyPM);
-              dynamicSlotsList.push({
-                eventId: ev.id,
-                eventName: ev.name,
-                date: ev.date,
-                session: 'PM',
-                key: keyPM
-              });
-            }
           }
         }
       });
 
-      // Chronological sort
-      dynamicSlotsList.sort((a, b) => {
+      const filteredEventDateColumns = eventDateColumns.filter(column =>
+        (!event || column.eventId === (event as string) || column.eventName.toLowerCase() === (event as string).toLowerCase()) &&
+        (!date || column.date === date)
+      );
+
+      filteredEventDateColumns.sort((a, b) => {
         const dayCmp = a.date.localeCompare(b.date);
         if (dayCmp !== 0) return dayCmp;
-        return a.session.localeCompare(b.session);
+        return a.eventName.localeCompare(b.eventName);
       });
 
       // 3. Group students by coursework program (BSIT, BSGE, etc.) for multi-sheet layout
@@ -804,10 +801,23 @@ async function startServer() {
 
       const sortedPrograms = Object.keys(studentsByProgram).sort();
 
+      const formatEventDateHeader = (date: string) => {
+        const match = date.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+        return match ? `${Number(match[2])}-${Number(match[3])}-${match[1]}` : date;
+      };
+
+      const headers = [
+        'Student ID',
+        'Full Name',
+        'Program/Course',
+        'Year Level',
+        'Section',
+        ...filteredEventDateColumns.map(column => `${column.eventName} (${formatEventDateHeader(column.date)})`),
+        'Total Sanction Time'
+      ];
+
       if (sortedPrograms.length === 0) {
-        const ws = xlsx.utils.aoa_to_sheet([
-          ['Student ID', 'Full Name', 'Program/Course', 'Year Level', 'Section']
-        ]);
+        const ws = xlsx.utils.aoa_to_sheet([headers]);
         xlsx.utils.book_append_sheet(wb, ws, 'Empty Summary');
       } else {
         sortedPrograms.forEach(prog => {
@@ -829,17 +839,6 @@ async function startServer() {
             const nameB = String(b.fullName || '').toLowerCase();
             return nameA.localeCompare(nameB);
           });
-
-          // Layout headers list: Student ID, Full Name, Program/Course, Year Level, Section, Total Sanction Time, then dynamic slots
-          const headers = [
-            'Student ID',
-            'Full Name',
-            'Program/Course',
-            'Year Level',
-            'Section',
-            'Total Sanction Time',
-            ...dynamicSlotsList.map(slot => `${slot.eventName} (${slot.date} ${slot.session})`)
-          ];
 
           const todayStr = new Date().toISOString().split('T')[0];
 
@@ -872,24 +871,44 @@ async function startServer() {
               student.fullName,
               student.program,
               student.yearLevel,
-              student.section,
-              formatSanctionDuration(totalSanctionHours)
+              student.section
             ];
 
-            dynamicSlotsList.forEach(slot => {
-              const attended = allLogs.some(
+            filteredEventDateColumns.forEach(column => {
+              const matchingLogs = allLogs.filter(
                 a => a.studentId === student.studentId &&
-                     a.eventId === slot.eventId &&
-                     a.date === slot.date &&
-                     getSessionType(a.timeIn) === slot.session
+                     a.eventId === column.eventId &&
+                     a.date === column.date
               );
-              rowData.push(attended ? 'Present' : 'Absent');
+
+              const hasTimeIn = matchingLogs.some(log => Boolean(log.timeIn && log.timeIn.trim()));
+              const hasTimeOut = matchingLogs.some(log =>
+                Boolean(log.timeOut && log.timeOut.trim() && log.timeOut !== 'On Premises')
+              );
+              const attendanceStatus = hasTimeIn && hasTimeOut
+                ? 'In and Out'
+                : hasTimeIn
+                  ? 'In Only'
+                  : hasTimeOut
+                    ? 'Out Only'
+                    : 'Absent';
+              rowData.push(attendanceStatus);
             });
 
+            rowData.push(formatSanctionDuration(totalSanctionHours));
             return rowData;
           });
 
           const ws = xlsx.utils.aoa_to_sheet([headers, ...rows]);
+          ws['!cols'] = [
+            { wch: 14 },
+            { wch: 26 },
+            { wch: 20 },
+            { wch: 12 },
+            { wch: 10 },
+            ...filteredEventDateColumns.map(() => ({ wch: 30 })),
+            { wch: 20 }
+          ];
           const cleanSheetName = prog.replace(/[\\/?*\[\]:]/g, '').substring(0, 31) || 'Sheet';
           xlsx.utils.book_append_sheet(wb, ws, cleanSheetName);
         });

@@ -40,6 +40,7 @@ export const events = pgTable("events", {
 
 export const students = pgTable("students", {
   studentId: text("student_id").primaryKey(),
+  qrCodeId: text("qr_code_id"),
   fullName: text("full_name").notNull(),
   department: text("department").notNull(),
   program: text("program").notNull(),
