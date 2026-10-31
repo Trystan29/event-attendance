@@ -28,7 +28,7 @@ import {
   Event, 
   AttendanceRecord 
 } from '../src/types.ts';
-import { normalizeStudentName } from '../src/utils/studentName.ts';
+import { normalizeStudentName, studentNamesMatch } from '../src/utils/studentName.ts';
 
 const DB_DIR = path.join(process.cwd(), 'data');
 const DB_FILE = path.join(DB_DIR, 'db.json');
@@ -85,97 +85,6 @@ const DEFAULT_DB: DatabaseSchema = {
   activeScanMode: 'in'
 };
 
-const studentNameTokens = (name: string) =>
-  normalizeStudentName(name)
-    .normalize('NFKD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .toLocaleLowerCase()
-    .match(/[a-z0-9]+/g) || [];
-
-const hasOneCharacterDifference = (left: string, right: string) => {
-  if (Math.abs(left.length - right.length) > 1) return false;
-
-  let leftIndex = 0;
-  let rightIndex = 0;
-  let differences = 0;
-
-  while (leftIndex < left.length && rightIndex < right.length) {
-    if (left[leftIndex] === right[rightIndex]) {
-      leftIndex++;
-      rightIndex++;
-      continue;
-    }
-
-    differences++;
-    if (differences > 1) return false;
-    if (left.length > right.length) leftIndex++;
-    else if (right.length > left.length) rightIndex++;
-    else {
-      leftIndex++;
-      rightIndex++;
-    }
-  }
-
-  if (leftIndex < left.length || rightIndex < right.length) differences++;
-  return differences === 1;
-};
-
-const studentNamesMatch = (leftName: string, rightName: string) => {
-  const leftTokens = studentNameTokens(leftName);
-  const rightTokens = studentNameTokens(rightName);
-  if (leftTokens.length !== rightTokens.length) return false;
-
-  const findMatch = (leftIndex: number, usedRightTokens: Set<number>, usedTypo: boolean): boolean => {
-    if (leftIndex === leftTokens.length) return true;
-
-    const leftToken = leftTokens[leftIndex];
-    for (let rightIndex = 0; rightIndex < rightTokens.length; rightIndex++) {
-      if (usedRightTokens.has(rightIndex)) continue;
-      const rightToken = rightTokens[rightIndex];
-      const isExact = leftToken === rightToken;
-      const isInitial = Math.min(leftToken.length, rightToken.length) === 1
-        && (leftToken.startsWith(rightToken) || rightToken.startsWith(leftToken));
-      const isSingleTypo = !usedTypo && hasOneCharacterDifference(leftToken, rightToken);
-      if (!isExact && !isInitial && !isSingleTypo) continue;
-
-      usedRightTokens.add(rightIndex);
-      if (findMatch(leftIndex + 1, usedRightTokens, usedTypo || (!isExact && !isInitial))) return true;
-      usedRightTokens.delete(rightIndex);
-    }
-
-    return false;
-  };
-
-  return leftTokens.length > 0 && findMatch(0, new Set<number>(), false);
-};
-
-const studentNameExpandsInitials = (abbreviatedName: string, fullName: string) => {
-  const abbreviatedTokens = studentNameTokens(abbreviatedName);
-  const fullTokens = studentNameTokens(fullName);
-  if (abbreviatedTokens.length !== fullTokens.length) return false;
-
-  const matchTokens = (index: number, usedTokens: Set<number>, expandedInitial: boolean): boolean => {
-    if (index === abbreviatedTokens.length) return expandedInitial;
-
-    const token = abbreviatedTokens[index];
-    for (let candidateIndex = 0; candidateIndex < fullTokens.length; candidateIndex++) {
-      if (usedTokens.has(candidateIndex)) continue;
-      const candidate = fullTokens[candidateIndex];
-      const isExact = token === candidate;
-      const isInitialExpansion = token.length === 1 && candidate.startsWith(token);
-      if (!isExact && !isInitialExpansion) continue;
-
-      usedTokens.add(candidateIndex);
-      if (matchTokens(index + 1, usedTokens, expandedInitial || isInitialExpansion)) return true;
-      usedTokens.delete(candidateIndex);
-    }
-
-    return false;
-  };
-
-  return abbreviatedTokens.length > 0 && matchTokens(0, new Set<number>(), false);
-};
-
 async function safeDbWrite(operation: () => Promise<any>, description: string) {
   try {
     await operation();
@@ -197,15 +106,7 @@ export class JSONDatabase {
   private normalizeStoredStudentNames(): Student[] {
     const changedStudents: Student[] = [];
     this.data.students = this.data.students.map(student => {
-      const storedName = normalizeStudentName(student.fullName);
-      const historicalNames = [...new Set(
-        this.data.attendance
-          .filter(record => record.studentId === student.studentId && record.studentName)
-          .map(record => normalizeStudentName(record.studentName))
-          .filter(name => studentNameExpandsInitials(storedName, name))
-      )];
-      const recoveredName = historicalNames.length === 1 ? historicalNames[0] : storedName;
-      const fullName = normalizeStudentName(recoveredName);
+      const fullName = normalizeStudentName(student.fullName);
       const qrCodeId = student.qrCodeId || student.studentId;
       if (fullName !== student.fullName || qrCodeId !== student.qrCodeId) {
         const updatedStudent = { ...student, fullName, qrCodeId };
@@ -472,6 +373,7 @@ export class JSONDatabase {
       matchBy?: 'studentId' | 'fullName';
       updateFields?: Array<'studentId' | 'fullName' | 'department' | 'program' | 'yearLevel' | 'section'>;
       replaceExisting?: boolean;
+      addUnmatchedNames?: string[];
     } = {}
   ): { added: number; updated: number; skipped: number; ambiguous: number; idUpdated: number } {
     const matchBy = options.matchBy || 'studentId';
@@ -487,6 +389,10 @@ export class JSONDatabase {
     const additions: Student[] = [];
     const usedMatches = new Set<string>();
     const allowedFields = new Set(['studentId', 'fullName', 'department', 'program', 'yearLevel', 'section']);
+    const approvedNewNames = new Set(
+      (options.addUnmatchedNames || []).map(name => normalizeStudentName(name).toLocaleLowerCase())
+    );
+    const unresolvedNames: string[] = [];
 
     for (const importedStudent of students) {
       const incoming = {
@@ -494,19 +400,33 @@ export class JSONDatabase {
         studentId: String(importedStudent.studentId).trim(),
         fullName: normalizeStudentName(importedStudent.fullName)
       };
-      let matches = matchBy === 'studentId'
-        ? originalStudents.filter(student => student.studentId.trim().toLocaleLowerCase() === incoming.studentId.toLocaleLowerCase())
-        : originalStudents.filter(student => studentNamesMatch(student.fullName, incoming.fullName));
+      let matches: Student[];
+      if (matchBy === 'studentId') {
+        matches = originalStudents.filter(student =>
+          student.studentId.trim().toLocaleLowerCase() === incoming.studentId.toLocaleLowerCase()
+        );
+      } else {
+        matches = originalStudents.filter(student => studentNamesMatch(student.fullName, incoming.fullName));
+        if (matches.length === 0) {
+          matches = originalStudents.filter(student => studentNamesMatch(student.fullName, incoming.fullName, true));
+        }
+      }
 
       if (matches.length > 1 || (matches.length === 1 && usedMatches.has(matches[0].studentId))) {
         ambiguous++;
+        unresolvedNames.push(`${incoming.fullName} (matches multiple existing students)`);
         continue;
       }
 
       const existingStudent = matches[0];
       if (!existingStudent) {
-        if (matchBy === 'fullName' && updateFields.includes('studentId')) {
+        if (
+          matchBy === 'fullName'
+          && updateFields.includes('studentId')
+          && !approvedNewNames.has(incoming.fullName.toLocaleLowerCase())
+        ) {
           skipped++;
+          unresolvedNames.push(`${incoming.fullName} (no existing student match; approve as new or correct the name)`);
           continue;
         }
         additions.push({
@@ -542,6 +462,12 @@ export class JSONDatabase {
 
       updates.push({ previous: existingStudent, student: nextStudent });
       updated++;
+    }
+
+    if (unresolvedNames.length > 0) {
+      throw new Error(
+        `No changes were applied because these names could not be matched safely: ${unresolvedNames.join('; ')}.`
+      );
     }
 
     const updatedByOriginalId = new Map(updates.map(({ previous, student }) => [previous.studentId, student]));

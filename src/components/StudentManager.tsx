@@ -22,7 +22,7 @@ import {
   GraduationCap
 } from 'lucide-react';
 import { Student, Department, Program, Section } from '../types';
-import { normalizeStudentName, StudentNameOrder } from '../utils/studentName';
+import { normalizeStudentName, StudentNameOrder, studentNamesMatch } from '../utils/studentName';
 
 interface StudentManagerProps {
   currentUserRole: 'admin' | 'staff';
@@ -107,32 +107,25 @@ export default function StudentManager({ currentUserRole }: StudentManagerProps)
     'fullName', 'department', 'program', 'yearLevel', 'section'
   ]);
   const [updateExistingStudents, setUpdateExistingStudents] = useState(true);
+  const [approvedNewImportNames, setApprovedNewImportNames] = useState('');
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [qrCache, setQrCache] = useState<{ [id: string]: string }>({});
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
   const getQrIdentity = (student: Student) => student.qrCodeId || student.studentId;
 
-  const normalizeImportedStudentName = (rawName: string, studentId: string) => {
-    if (studentNameOrder !== 'auto' || rawName.includes(',')) {
-      return normalizeStudentName(rawName, studentNameOrder);
+  const normalizeImportedStudentName = (rawName: string) => {
+    const cleanedName = rawName.replace(/^\s*\d+\s*:\s*/, '');
+    if (studentNameOrder !== 'auto' || cleanedName.includes(',')) {
+      return normalizeStudentName(cleanedName, studentNameOrder);
     }
 
     const candidates = [
-      normalizeStudentName(rawName, 'given-first'),
-      normalizeStudentName(rawName, 'surname-first')
+      normalizeStudentName(cleanedName, 'given-first'),
+      normalizeStudentName(cleanedName, 'surname-first')
     ];
-    const currentStudent = students.find(student =>
-      student.studentId.trim().toLocaleLowerCase() === studentId.trim().toLocaleLowerCase()
-    );
-    const existingNames = new Set(
-      students.map(student => normalizeStudentName(student.fullName).toLocaleLowerCase())
-    );
-    const namesToMatch = new Set(existingNames);
-    if (currentStudent) namesToMatch.add(normalizeStudentName(currentStudent.fullName).toLocaleLowerCase());
-
     const matchingCandidates = candidates.filter(candidate =>
-      namesToMatch.has(candidate.toLocaleLowerCase())
+      students.some(student => studentNamesMatch(student.fullName, candidate))
     );
     return matchingCandidates.length === 1 ? matchingCandidates[0] : candidates[0];
   };
@@ -277,11 +270,40 @@ export default function StudentManager({ currentUserRole }: StudentManagerProps)
       setErrorMessage('Student ID and name are required.');
       return;
     }
-    void handleUpdateStudent(editingStudentId, {
+    const originalStudent = students.find(student => student.studentId === editingStudentId);
+    if (!originalStudent) {
+      setErrorMessage('Could not find the student record being edited. Refresh the directory and try again.');
+      return;
+    }
+
+    const updatedFields = {
       ...editingStudentDraft,
       studentId: editingStudentDraft.studentId.trim(),
       fullName: editingStudentDraft.fullName.trim()
-    });
+    };
+    const fieldLabels: Array<[keyof typeof updatedFields, string]> = [
+      ['studentId', 'Student ID'],
+      ['fullName', 'Name'],
+      ['department', 'College'],
+      ['program', 'Program'],
+      ['yearLevel', 'Year'],
+      ['section', 'Section']
+    ];
+    const changes = fieldLabels
+      .filter(([field]) => (originalStudent[field] || '') !== (updatedFields[field] || ''))
+      .map(([field, label]) => `${label}: "${originalStudent[field] || '(blank)'}" -> "${updatedFields[field] || '(blank)'}"`);
+
+    if (changes.length === 0) {
+      setEditingStudentId(null);
+      setEditingStudentDraft(null);
+      return;
+    }
+
+    if (!window.confirm(`Save these changes for ${originalStudent.fullName}?\n\n${changes.join('\n')}`)) {
+      return;
+    }
+
+    void handleUpdateStudent(editingStudentId, updatedFields);
   };
 
   // Delete handler
@@ -351,7 +373,12 @@ export default function StudentManager({ currentUserRole }: StudentManagerProps)
       } else {
         setImportWorksheets([]);
         setSelectedImportWorksheet('');
-        setImportCsvInput(await file.text());
+        const fileData = await file.arrayBuffer();
+        try {
+          setImportCsvInput(new TextDecoder('utf-8', { fatal: true }).decode(fileData));
+        } catch {
+          setImportCsvInput(new TextDecoder('windows-1252').decode(fileData));
+        }
       }
       setImportFileName(file.name);
     } catch (err) {
@@ -384,7 +411,6 @@ export default function StudentManager({ currentUserRole }: StudentManagerProps)
   const processImport = async () => {
     setErrorMessage(null);
     setSuccessMessage(null);
-    setIsImportModalOpen(false);
 
     if (!importCsvInput.trim()) {
       setErrorMessage('Please paste or upload a valid CSV list format.');
@@ -450,7 +476,7 @@ export default function StudentManager({ currentUserRole }: StudentManagerProps)
         }
       }
 
-      const normalizedName = normalizeImportedStudentName(fullName, studentId);
+      const normalizedName = normalizeImportedStudentName(fullName);
       const importKey = importMatchBy === 'fullName'
         ? normalizedName.toLocaleLowerCase()
         : studentId.toLocaleLowerCase();
@@ -472,15 +498,49 @@ export default function StudentManager({ currentUserRole }: StudentManagerProps)
       return;
     }
 
+    let studentsToImport = Array.from(parsedStudents.values());
+    let duplicateIdSkippedCount = 0;
+    if (updateExistingStudents && importUpdateFields.includes('studentId')) {
+      const rowsByStudentId = new Map<string, Student[]>();
+      for (const student of parsedStudents.values()) {
+        const normalizedId = student.studentId.trim().toLocaleLowerCase();
+        const rows = rowsByStudentId.get(normalizedId) || [];
+        rows.push(student);
+        rowsByStudentId.set(normalizedId, rows);
+      }
+      const duplicateIds = [...rowsByStudentId.entries()].filter(([, rows]) => rows.length > 1);
+      if (duplicateIds.length > 0) {
+        const duplicateIdSet = new Set(duplicateIds.map(([id]) => id));
+        const duplicateRows = duplicateIds.map(([id, rows]) =>
+          `ID "${rows[0].studentId}" (${rows.map(student => student.fullName).join(', ')})`
+        ).join('\n');
+        duplicateIdSkippedCount = studentsToImport.filter(student =>
+          duplicateIdSet.has(student.studentId.trim().toLocaleLowerCase())
+        ).length;
+        const shouldContinue = window.confirm(
+          `These student IDs appear more than once in the file:\n\n${duplicateRows}\n\nSkip all ${duplicateIdSkippedCount} row(s) using these IDs and import the remaining students?`
+        );
+        if (!shouldContinue) return;
+        studentsToImport = studentsToImport.filter(student =>
+          !duplicateIdSet.has(student.studentId.trim().toLocaleLowerCase())
+        );
+        if (studentsToImport.length === 0) {
+          setErrorMessage('Every valid row had a duplicate student ID, so nothing was imported.');
+          return;
+        }
+      }
+    }
+
     try {
       const res = await fetch('/api/students/import', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          students: Array.from(parsedStudents.values()),
+          students: studentsToImport,
           matchBy: importMatchBy,
           updateFields: updateExistingStudents ? importUpdateFields : [],
-          replaceExisting: updateExistingStudents
+          replaceExisting: updateExistingStudents,
+          addUnmatchedNames: approvedNewImportNames.split(/\r?\n/).map(name => name.trim()).filter(Boolean)
         })
       });
 
@@ -492,6 +552,7 @@ export default function StudentManager({ currentUserRole }: StudentManagerProps)
       const stats = await res.json();
       
       let message = `Roster successfully imported! Added: ${stats.added} new records, Updated: ${stats.updated} existing records, Skipped: ${stats.skipped || 0} existing records.`;
+      if (duplicateIdSkippedCount > 0) message += ` Skipped ${duplicateIdSkippedCount} row(s) with duplicate student IDs.`;
       if (stats.ambiguous > 0) message += ` Ambiguous matches skipped: ${stats.ambiguous}.`;
       if (stats.idUpdated > 0) {
         message += ` Student IDs corrected for ${stats.idUpdated} students; existing QR badges and attendance reports are preserved.`;
@@ -1902,11 +1963,11 @@ export default function StudentManager({ currentUserRole }: StudentManagerProps)
                   className="w-full text-xs py-2 px-3 border border-slate-200 rounded-lg bg-white focus:outline-none focus:ring-1 focus:ring-indigo-500"
                 >
                   <option value="studentId" disabled={importUpdateFields.includes('studentId')}>Student ID</option>
-                  <option value="fullName" disabled={importUpdateFields.includes('fullName')}>Name (Last, First Middle)</option>
+                  <option value="fullName">Name (Last, First Middle)</option>
                 </select>
                 <p className="text-[10px] text-slate-500">
                   {importMatchBy === 'fullName'
-                  ? 'Use this to correct student IDs from a roster matched by name. Names must match a single existing student.'
+                  ? 'Match the original roster by name, then update the selected fields. Names must identify one existing student.'
                     : 'Use this to correct a name or other details while keeping each student ID as the match key.'}
                 </p>
               </div>
@@ -1929,11 +1990,8 @@ export default function StudentManager({ currentUserRole }: StudentManagerProps)
                         onChange={(e) => {
                           const checked = e.target.checked;
                           if (checked && field === 'studentId') {
-                            setImportUpdateFields(current => [...current.filter(selectedField => selectedField !== 'fullName'), field]);
+                            setImportUpdateFields(current => [...new Set([...current, field])]);
                             setImportMatchBy('fullName');
-                          } else if (checked && field === 'fullName') {
-                            setImportUpdateFields(current => [...current.filter(selectedField => selectedField !== 'studentId'), field]);
-                            setImportMatchBy('studentId');
                           } else {
                             setImportUpdateFields(current =>
                               checked
@@ -1950,7 +2008,7 @@ export default function StudentManager({ currentUserRole }: StudentManagerProps)
                 </div>
                 {importUpdateFields.includes('studentId') && (
                   <p className="text-[10px] font-medium text-amber-700">
-                    IDs will be matched to students by name automatically. Student names must match the existing roster. QR badges and attendance reports stay linked.
+                    Student IDs will be matched by name. The original roster name is used to find the student, then the selected Name field can replace it with the full name from this file. QR badges and attendance reports stay linked.
                   </p>
                 )}
               </fieldset>
@@ -1984,6 +2042,25 @@ export default function StudentManager({ currentUserRole }: StudentManagerProps)
                   When unchecked, existing students are left unchanged. New student IDs are always added.
                 </span>
               </label>
+
+              {updateExistingStudents && importMatchBy === 'fullName' && importUpdateFields.includes('studentId') && (
+                <div className="space-y-1.5 rounded-lg border border-amber-200 bg-amber-50 p-3">
+                  <label className="block text-[11px] font-bold text-slate-700 uppercase" htmlFor="approved-new-import-names">
+                    Exact names approved as new students
+                  </label>
+                  <textarea
+                    id="approved-new-import-names"
+                    rows={2}
+                    value={approvedNewImportNames}
+                    onChange={e => setApprovedNewImportNames(e.target.value)}
+                    placeholder={'One full name per line, for example:\nMolano, Mark Justin Carl B.'}
+                    className="w-full rounded border border-amber-200 bg-white p-2 text-xs"
+                  />
+                  <p className="text-[10px] text-slate-600">
+                    Only names listed here can be added when no existing student matches. Any other unmatched or ambiguous name stops the whole ID update without applying changes.
+                  </p>
+                </div>
+              )}
 
               <div className="flex gap-2 justify-end pt-4 border-t">
                 <button

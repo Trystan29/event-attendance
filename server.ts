@@ -445,10 +445,17 @@ async function startServer() {
     )) {
       return res.status(400).json({ error: 'One or more selected student fields cannot be updated.' });
     }
+    const requestedNewNames = req.body.addUnmatchedNames;
+    if (requestedNewNames !== undefined && (
+      !Array.isArray(requestedNewNames) ||
+      requestedNewNames.some((name: unknown) => typeof name !== 'string')
+    )) {
+      return res.status(400).json({ error: 'addUnmatchedNames must be an array of student names.' });
+    }
     const fieldsToUpdate = Array.isArray(requestedUpdateFields) ? requestedUpdateFields : [];
-    if (fieldsToUpdate.includes(matchBy || 'studentId')) {
+    if ((matchBy || 'studentId') === 'studentId' && fieldsToUpdate.includes('studentId')) {
       return res.status(400).json({
-        error: `Choose a different matching field before updating ${matchBy === 'fullName' ? 'names' : 'student IDs'}.`
+        error: 'Choose name matching before updating student IDs.'
       });
     }
     
@@ -472,7 +479,8 @@ async function startServer() {
       const { added, updated, skipped, ambiguous, idUpdated } = db.addStudentsBatch(validStudents, {
         matchBy: matchBy || 'studentId',
         updateFields: requestedUpdateFields,
-        replaceExisting: req.body.replaceExisting
+        replaceExisting: req.body.replaceExisting,
+        addUnmatchedNames: requestedNewNames
       });
       broadcastStats();
       res.json({ message: `Successfully parsed student rosters format.`, added, updated, skipped, ambiguous, idUpdated });
