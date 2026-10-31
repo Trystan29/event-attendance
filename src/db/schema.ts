@@ -1,66 +1,69 @@
-import { pgTable, text, integer, boolean } from "drizzle-orm/pg-core";
+import { mysqlTable, varchar, text, int, boolean } from 'drizzle-orm/mysql-core';
 
-export const users = pgTable("users", {
-  id: text("id").primaryKey(),
-  username: text("username").notNull().unique(),
-  role: text("role").$type<"admin" | "staff">().notNull(),
-  fullName: text("full_name").notNull(),
-  password: text("password")
+const id = (name: string) => varchar(name, { length: 191 });
+const value = (name: string) => varchar(name, { length: 255 });
+
+export const users = mysqlTable('users', {
+  id: id('id').primaryKey(),
+  username: value('username').notNull().unique(),
+  role: value('role').$type<'admin' | 'staff'>().notNull(),
+  fullName: value('full_name').notNull(),
+  password: value('password')
 });
 
-export const departments = pgTable("departments", {
-  id: text("id").primaryKey(),
-  name: text("name").notNull(),
-  code: text("code").notNull()
+export const departments = mysqlTable('departments', {
+  id: id('id').primaryKey(),
+  name: value('name').notNull(),
+  code: value('code').notNull()
 });
 
-export const programs = pgTable("programs", {
-  id: text("id").primaryKey(),
-  name: text("name").notNull(),
-  code: text("code").notNull(),
-  departmentCode: text("department_code").notNull()
+export const programs = mysqlTable('programs', {
+  id: id('id').primaryKey(),
+  name: value('name').notNull(),
+  code: value('code').notNull(),
+  departmentCode: value('department_code').notNull()
 });
 
-export const sections = pgTable("sections", {
-  id: text("id").primaryKey(),
-  name: text("name").notNull()
+export const sections = mysqlTable('sections', {
+  id: id('id').primaryKey(),
+  name: value('name').notNull()
 });
 
-export const events = pgTable("events", {
-  id: text("id").primaryKey(),
-  name: text("name").notNull(),
-  description: text("description"),
-  date: text("date").notNull(),
-  isActive: boolean("is_active").notNull().default(true),
-  sanctionTime: text("sanction_time"),
-  sanctionHours: integer("sanction_hours"),
-  createdAt: text("created_at"),
-  sessions: text("sessions").$type<"AM" | "PM" | "Both">()
+export const events = mysqlTable('events', {
+  id: id('id').primaryKey(),
+  name: value('name').notNull(),
+  description: text('description'),
+  date: value('date').notNull(),
+  isActive: boolean('is_active').notNull().default(true),
+  sanctionTime: value('sanction_time'),
+  sanctionHours: int('sanction_hours'),
+  createdAt: value('created_at'),
+  sessions: value('sessions').$type<'AM' | 'PM' | 'Both'>()
 });
 
-export const students = pgTable("students", {
-  studentId: text("student_id").primaryKey(),
-  qrCodeId: text("qr_code_id"),
-  fullName: text("full_name").notNull(),
-  department: text("department").notNull(),
-  program: text("program").notNull(),
-  yearLevel: text("year_level").notNull(),
-  section: text("section").notNull(),
-  createdAt: text("created_at")
+export const students = mysqlTable('students', {
+  studentId: id('student_id').primaryKey(),
+  qrCodeId: id('qr_code_id'),
+  fullName: value('full_name').notNull(),
+  department: value('department').notNull(),
+  program: value('program').notNull(),
+  yearLevel: value('year_level').notNull(),
+  section: value('section').notNull(),
+  createdAt: value('created_at')
 });
 
-export const attendance = pgTable("attendance", {
-  id: text("id").primaryKey(),
-  studentId: text("student_id").notNull(),
-  studentName: text("student_name").notNull(),
-  department: text("department").notNull(),
-  program: text("program").notNull(),
-  yearLevel: text("year_level").notNull(),
-  section: text("section").notNull(),
-  eventId: text("event_id").notNull(),
-  eventName: text("event_name").notNull(),
-  date: text("date").notNull(),
-  timeIn: text("time_in").notNull(),
-  timeOut: text("time_out"),
-  scannedBy: text("scanned_by").notNull()
+export const attendance = mysqlTable('attendance', {
+  id: id('id').primaryKey(),
+  studentId: id('student_id').notNull(),
+  studentName: value('student_name').notNull(),
+  department: value('department').notNull(),
+  program: value('program').notNull(),
+  yearLevel: value('year_level').notNull(),
+  section: value('section').notNull(),
+  eventId: id('event_id').notNull(),
+  eventName: value('event_name').notNull(),
+  date: value('date').notNull(),
+  timeIn: value('time_in').notNull(),
+  timeOut: value('time_out'),
+  scannedBy: value('scanned_by').notNull()
 });

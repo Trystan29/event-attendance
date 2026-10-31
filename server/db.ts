@@ -6,7 +6,7 @@
 import fs from 'fs';
 import path from 'path';
 import { randomUUID } from 'crypto';
-import { db } from "../src/db/index.ts";
+import { db, pool } from "../src/db/index.ts";
 import { 
   users as usersTable, 
   students as studentsTable, 
@@ -16,7 +16,7 @@ import {
   events as eventsTable, 
   attendance as attendanceTable 
 } from "../src/db/schema.ts";
-import { eq, sql } from "drizzle-orm";
+import { eq } from "drizzle-orm";
 import { csvStudents } from './csvSeedData.ts';
 import { buildConsolidatedAttendance } from './csvImporter.ts';
 import { 
@@ -32,6 +32,8 @@ import { normalizeStudentName, studentNamesMatch } from '../src/utils/studentNam
 
 const DB_DIR = path.join(process.cwd(), 'data');
 const DB_FILE = path.join(DB_DIR, 'db.json');
+let mysqlAvailable = true;
+let mysqlWarningShown = false;
 
 // Interface for serialized database
 interface DatabaseSchema {
@@ -86,11 +88,16 @@ const DEFAULT_DB: DatabaseSchema = {
 };
 
 async function safeDbWrite(operation: () => Promise<any>, description: string) {
+  if (!mysqlAvailable) return;
   try {
     await operation();
-    console.log(`[SQL] ${description} synced successfully.`);
+    console.log(`[MySQL] ${description} synced successfully.`);
   } catch (err) {
-    console.error(`[SQL Error] Failed to sync ${description}:`, err);
+    mysqlAvailable = false;
+    if (!mysqlWarningShown) {
+      mysqlWarningShown = true;
+      console.warn('[MySQL] Database sync stopped. Continuing with data/db.json until the server restarts.');
+    }
   }
 }
 
@@ -174,16 +181,29 @@ export class JSONDatabase {
   }
 
   async initialize(): Promise<void> {
-    console.log('[SQL] Initializing database and pre-loading cache from PostgreSQL...');
+    console.log('[MySQL] Initializing database and pre-loading the local data cache...');
     try {
-      await db.execute(sql`ALTER TABLE students ADD COLUMN IF NOT EXISTS qr_code_id text`);
-      await db.execute(sql`UPDATE students SET qr_code_id = student_id WHERE qr_code_id IS NULL OR qr_code_id = ''`);
+      const tables = [
+        `CREATE TABLE IF NOT EXISTS users (id VARCHAR(191) PRIMARY KEY, username VARCHAR(255) NOT NULL UNIQUE, role VARCHAR(255) NOT NULL, full_name VARCHAR(255) NOT NULL, password VARCHAR(255) NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+        `CREATE TABLE IF NOT EXISTS departments (id VARCHAR(191) PRIMARY KEY, name VARCHAR(255) NOT NULL, code VARCHAR(255) NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+        `CREATE TABLE IF NOT EXISTS programs (id VARCHAR(191) PRIMARY KEY, name VARCHAR(255) NOT NULL, code VARCHAR(255) NOT NULL, department_code VARCHAR(255) NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+        `CREATE TABLE IF NOT EXISTS sections (id VARCHAR(191) PRIMARY KEY, name VARCHAR(255) NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+        `CREATE TABLE IF NOT EXISTS events (id VARCHAR(191) PRIMARY KEY, name VARCHAR(255) NOT NULL, description TEXT NULL, date VARCHAR(255) NOT NULL, is_active BOOLEAN NOT NULL DEFAULT TRUE, sanction_time VARCHAR(255) NULL, sanction_hours INT NULL, created_at VARCHAR(255) NULL, sessions VARCHAR(255) NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+        `CREATE TABLE IF NOT EXISTS students (student_id VARCHAR(191) PRIMARY KEY, qr_code_id VARCHAR(191) NULL, full_name VARCHAR(255) NOT NULL, department VARCHAR(255) NOT NULL, program VARCHAR(255) NOT NULL, year_level VARCHAR(255) NOT NULL, section VARCHAR(255) NOT NULL, created_at VARCHAR(255) NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+        `CREATE TABLE IF NOT EXISTS attendance (id VARCHAR(191) PRIMARY KEY, student_id VARCHAR(191) NOT NULL, student_name VARCHAR(255) NOT NULL, department VARCHAR(255) NOT NULL, program VARCHAR(255) NOT NULL, year_level VARCHAR(255) NOT NULL, section VARCHAR(255) NOT NULL, event_id VARCHAR(191) NOT NULL, event_name VARCHAR(255) NOT NULL, date VARCHAR(255) NOT NULL, time_in VARCHAR(255) NOT NULL, time_out VARCHAR(255) NULL, scanned_by VARCHAR(255) NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`
+      ];
+      for (const statement of tables) await pool.query(statement);
+      const [qrCodeColumn] = await pool.query("SHOW COLUMNS FROM students LIKE 'qr_code_id'");
+      if (Array.isArray(qrCodeColumn) && qrCodeColumn.length === 0) {
+        await pool.query('ALTER TABLE students ADD COLUMN qr_code_id VARCHAR(191) NULL');
+      }
+      await pool.query("UPDATE students SET qr_code_id = student_id WHERE qr_code_id IS NULL OR qr_code_id = ''");
       const sqlUsers = await db.select().from(usersTable);
       
       if (sqlUsers.length === 0) {
-        console.log('[SQL] SQL database is empty. Seeding it from the local session cache (data/db.json) so your last saved session is preserved...');
+        console.log('[MySQL] Database is empty. Seeding it from data/db.json so saved data is preserved...');
 
-        // IMPORTANT: seed Postgres from `this.data` (already loaded from the local
+        // IMPORTANT: seed MySQL from `this.data` (already loaded from the local
         // db.json backup in the constructor / loadLocalBackup()), NOT from DEFAULT_DB.
         // Seeding from DEFAULT_DB here is what previously wiped out whatever you had
         // saved before restarting `npm run dev`, since DEFAULT_DB is always rebuilt
@@ -210,7 +230,7 @@ export class JSONDatabase {
           await db.insert(attendanceTable).values(a);
         }
 
-        console.log('[SQL] SQL database seeded from local session cache successfully.');
+        console.log('[MySQL] Database seeded from the local session cache successfully.');
         // Do NOT reset this.data here — keep the session that was already loaded
         // from the local backup so it survives the restart.
       } else {
@@ -247,7 +267,7 @@ export class JSONDatabase {
             }
           }, `normalize names for ${normalizedStudents.length} students`);
         }
-        console.log(`[SQL] Successfully pre-loaded:`);
+        console.log(`[MySQL] Successfully pre-loaded:`);
         console.log(`      - ${this.data.users.length} users`);
         console.log(`      - ${this.data.students.length} students`);
         console.log(`      - ${this.data.attendance.length} attendance records`);
@@ -255,7 +275,11 @@ export class JSONDatabase {
       
       this.save();
     } catch (err) {
-      console.error('[SQL Error] Failed to connect or initialize SQL database. Operating with high-fidelity local cache.', err);
+      mysqlAvailable = false;
+      if (!mysqlWarningShown) {
+        mysqlWarningShown = true;
+        console.warn('[MySQL] Database is unavailable. Continuing with data/db.json; configure MYSQL_HOST, MYSQL_USER, MYSQL_PASSWORD, and MYSQL_DATABASE to enable MySQL sync.', err instanceof Error ? err.message : err);
+      }
     }
   }
 
@@ -550,12 +574,46 @@ export class JSONDatabase {
       studentId: updatedFields.studentId === undefined ? studentId : String(updatedFields.studentId).trim(),
       ...(updatedFields.fullName !== undefined ? { fullName: normalizeStudentName(updatedFields.fullName) } : {})
     };
-    this.addStudentsBatch([nextStudent], {
-      matchBy: 'studentId',
-      updateFields: ['studentId', 'fullName', 'department', 'program', 'yearLevel', 'section']
-    });
+    if (!nextStudent.studentId) throw new Error('Student ID is required.');
+    const duplicateId = this.data.students.some(student =>
+      student.studentId !== existingStudent.studentId
+      && student.studentId.trim().toLocaleLowerCase() === nextStudent.studentId.trim().toLocaleLowerCase()
+    );
+    if (duplicateId) throw new Error(`Student ID "${nextStudent.studentId}" is already assigned to another student.`);
 
-    return this.data.students.find(student => student.studentId === nextStudent.studentId);
+    // Keep the badge identity stable when the roster ID changes.
+    nextStudent.qrCodeId = existingStudent.qrCodeId || existingStudent.studentId;
+    const studentIndex = this.data.students.indexOf(existingStudent);
+    this.data.students[studentIndex] = nextStudent;
+    this.ensureSystemSetupEntities(nextStudent.program, nextStudent.section, nextStudent.department);
+
+    if (existingStudent.studentId !== nextStudent.studentId) {
+      this.data.attendance = this.data.attendance.map(record =>
+        record.studentId === existingStudent.studentId
+          ? { ...record, studentId: nextStudent.studentId }
+          : record
+      );
+    }
+    this.save();
+
+    safeDbWrite(async () => {
+      await db.transaction(async tx => {
+        if (existingStudent.studentId !== nextStudent.studentId) {
+          const temporaryId = `__student_edit_${randomUUID()}__`;
+          await tx.update(attendanceTable).set({ studentId: temporaryId })
+            .where(eq(attendanceTable.studentId, existingStudent.studentId));
+          await tx.delete(studentsTable).where(eq(studentsTable.studentId, existingStudent.studentId));
+          await tx.insert(studentsTable).values(nextStudent);
+          await tx.update(attendanceTable).set({ studentId: nextStudent.studentId })
+            .where(eq(attendanceTable.studentId, temporaryId));
+        } else {
+          await tx.update(studentsTable).set(nextStudent)
+            .where(eq(studentsTable.studentId, existingStudent.studentId));
+        }
+      });
+    }, `update student ${nextStudent.studentId}`);
+
+    return nextStudent;
   }
 
   deleteStudent(studentId: string): boolean {

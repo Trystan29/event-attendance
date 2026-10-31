@@ -1,37 +1,18 @@
-import { defineConfig } from "drizzle-kit";
-import * as dotenv from "dotenv";
+import { defineConfig } from 'drizzle-kit';
+import * as dotenv from 'dotenv';
 
 dotenv.config();
 
-const sqlHost = process.env.SQL_HOST;
-const sqlDbName = process.env.SQL_DB_NAME;
-const user = process.env.SQL_ADMIN_USER;
-const password = process.env.SQL_ADMIN_PASSWORD;
-
-if (!sqlHost) {
-  throw new Error("SQL_HOST must be set in environment variables.");
-}
-if (!sqlDbName) {
-  throw new Error("SQL_DB_NAME must be set in environment variables.");
-}
-if (!user) {
-  throw new Error("SQL_ADMIN_USER must be set in environment variables.");
-}
-if (!password) {
-  throw new Error("SQL_ADMIN_PASSWORD must be set in environment variables.");
-}
-
 export default defineConfig({
-  schema: "./src/db/schema.ts",
-  out: "./drizzle",
-  dialect: "postgresql",
-  schemaFilter: ["public"],
+  schema: './src/db/schema.ts',
+  out: './drizzle',
+  dialect: 'mysql',
   dbCredentials: {
-    host: sqlHost,
-    user: user,
-    password: password,
-    database: sqlDbName,
-    ssl: false,
+    host: process.env.MYSQL_HOST || process.env.SQL_HOST || '127.0.0.1',
+    port: Number(process.env.MYSQL_PORT || 3306),
+    user: process.env.MYSQL_USER || process.env.SQL_ADMIN_USER || process.env.SQL_USER || 'root',
+    password: process.env.MYSQL_PASSWORD ?? process.env.SQL_ADMIN_PASSWORD ?? process.env.SQL_PASSWORD ?? '',
+    database: process.env.MYSQL_DATABASE || process.env.SQL_DB_NAME || 'qr_attendance'
   },
-  verbose: true,
+  verbose: true
 });

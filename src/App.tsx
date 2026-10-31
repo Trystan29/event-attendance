@@ -88,7 +88,7 @@ try {
     enumerable: true
   });
 } catch (e) {
-  console.warn('[Firebase/Fetch] Failed to redefine window.fetch with Object.defineProperty, falling back to original fetch:', e);
+  console.warn('[Fetch] Could not install the authentication interceptor; using the original fetch:', e);
 }
 
 // Register a global unhandled promise rejection handler as early as possible
