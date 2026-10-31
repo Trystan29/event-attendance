@@ -87,6 +87,17 @@ const DEFAULT_DB: DatabaseSchema = {
   activeScanMode: 'in'
 };
 
+export class StudentIdConflictError extends Error {
+  constructor(public readonly conflicts: Array<{
+    studentId: string;
+    currentOwnerName: string;
+    incomingName: string;
+  }>) {
+    super('Some imported student IDs are already assigned to other students.');
+    this.name = 'StudentIdConflictError';
+  }
+}
+
 async function safeDbWrite(operation: () => Promise<any>, description: string) {
   if (!mysqlAvailable) return;
   try {
@@ -374,8 +385,7 @@ export class JSONDatabase {
     safeDbWrite(async () => {
       await db.insert(studentsTable)
         .values(newStudent)
-        .onConflictDoUpdate({
-          target: studentsTable.studentId,
+        .onDuplicateKeyUpdate({
           set: {
             qrCodeId: newStudent.qrCodeId,
             fullName: newStudent.fullName,
@@ -398,6 +408,7 @@ export class JSONDatabase {
       updateFields?: Array<'studentId' | 'fullName' | 'department' | 'program' | 'yearLevel' | 'section'>;
       replaceExisting?: boolean;
       addUnmatchedNames?: string[];
+      matchOverrides?: Array<{ studentId: string; importedName: string }>;
     } = {}
   ): { added: number; updated: number; skipped: number; ambiguous: number; idUpdated: number } {
     const matchBy = options.matchBy || 'studentId';
@@ -416,6 +427,20 @@ export class JSONDatabase {
     const approvedNewNames = new Set(
       (options.addUnmatchedNames || []).map(name => normalizeStudentName(name).toLocaleLowerCase())
     );
+    const overrideByName = new Map<string, string>();
+    const overrideStudentIds = new Set<string>();
+    for (const override of options.matchOverrides || []) {
+      const importedName = normalizeStudentName(override.importedName).toLocaleLowerCase();
+      const currentId = String(override.studentId || '').trim();
+      if (!importedName || !originalStudents.some(student => student.studentId === currentId)) {
+        throw new Error(`Manual match for "${override.importedName}" does not identify an existing student ID.`);
+      }
+      if (overrideByName.has(importedName) || overrideStudentIds.has(currentId)) {
+        throw new Error('Manual matches must use a unique imported name and a unique existing student ID.');
+      }
+      overrideByName.set(importedName, currentId);
+      overrideStudentIds.add(currentId);
+    }
     const unresolvedNames: string[] = [];
 
     for (const importedStudent of students) {
@@ -430,9 +455,14 @@ export class JSONDatabase {
           student.studentId.trim().toLocaleLowerCase() === incoming.studentId.toLocaleLowerCase()
         );
       } else {
-        matches = originalStudents.filter(student => studentNamesMatch(student.fullName, incoming.fullName));
-        if (matches.length === 0) {
-          matches = originalStudents.filter(student => studentNamesMatch(student.fullName, incoming.fullName, true));
+        const manualMatchId = overrideByName.get(incoming.fullName.toLocaleLowerCase());
+        if (manualMatchId) {
+          matches = originalStudents.filter(student => student.studentId === manualMatchId);
+        } else {
+          matches = originalStudents.filter(student => studentNamesMatch(student.fullName, incoming.fullName));
+          if (matches.length === 0) {
+            matches = originalStudents.filter(student => studentNamesMatch(student.fullName, incoming.fullName, true));
+          }
         }
       }
 
@@ -450,7 +480,7 @@ export class JSONDatabase {
           && !approvedNewNames.has(incoming.fullName.toLocaleLowerCase())
         ) {
           skipped++;
-          unresolvedNames.push(`${incoming.fullName} (no existing student match; approve as new or correct the name)`);
+          unresolvedNames.push(`${incoming.fullName} (no existing student match; select the correct roster record or correct the imported name)`);
           continue;
         }
         additions.push({
@@ -498,17 +528,24 @@ export class JSONDatabase {
     const finalStudents = originalStudents.map(student => updatedByOriginalId.get(student.studentId) || student);
     finalStudents.push(...additions);
     const studentIds = new Map<string, Student>();
+    const studentIdConflicts: StudentIdConflictError['conflicts'] = [];
     for (const student of finalStudents) {
       const normalizedId = student.studentId.trim().toLocaleLowerCase();
       const existingWithId = studentIds.get(normalizedId);
       if (!normalizedId || existingWithId) {
-        const conflict = existingWithId
-          ? `Student ID "${student.studentId}" is still assigned to "${existingWithId.fullName}" in the existing roster, and the import also assigns it to "${student.fullName}". Their imported name may not match the roster, so the current student was not recognized for an ID change. Check the name spelling and selected match field.`
-          : `A student has an empty student ID (${student.fullName}).`;
-        throw new Error(`${conflict} Check the source roster and selected match field. No changes were applied.`);
+        if (!normalizedId) {
+          throw new Error(`A student has an empty student ID (${student.fullName}). No changes were applied.`);
+        }
+        studentIdConflicts.push({
+          studentId: student.studentId,
+          currentOwnerName: existingWithId.fullName,
+          incomingName: student.fullName
+        });
+        continue;
       }
       studentIds.set(normalizedId, student);
     }
+    if (studentIdConflicts.length > 0) throw new StudentIdConflictError(studentIdConflicts);
 
     for (const { student } of updates) {
       this.ensureSystemSetupEntities(student.program, student.section, student.department);
@@ -786,26 +823,29 @@ export class JSONDatabase {
     return this.data.events.find(e => e.id === id);
   }
 
-  addEvent(event: Omit<Event, 'id' | 'isActive'>): Event {
+  addEvent(event: Omit<Event, 'id' | 'isActive'>, options: { activate?: boolean } = {}): Event {
+    const activate = options.activate !== false;
     const id = 'ev-' + Date.now().toString();
     const newEvent: Event = {
       id,
       ...event,
-      isActive: true,
+      isActive: activate,
       createdAt: new Date().toISOString()
     };
-    
-    this.data.events.forEach(e => {
-      e.isActive = false;
-    });
+
+    if (activate) {
+      this.data.events.forEach(e => {
+        e.isActive = false;
+      });
+    }
 
     this.data.events.push(newEvent);
     this.save();
 
     safeDbWrite(async () => {
-      await db.update(eventsTable).set({ isActive: false });
+      if (activate) await db.update(eventsTable).set({ isActive: false });
       await db.insert(eventsTable).values(newEvent);
-    }, `add active event ${event.name}`);
+    }, `add ${activate ? 'active' : 'inactive'} event ${event.name}`);
 
     return newEvent;
   }
@@ -990,7 +1030,7 @@ export class JSONDatabase {
           eventId: event.id,
           eventName: event.name,
           date: scanDate,
-          timeIn: null,
+          timeIn: '',
           timeOut: timeString,
           scannedBy: scannerUsername
         };
@@ -1084,10 +1124,13 @@ export class JSONDatabase {
       date?: string;
       sanctionTime?: string;
       sanctionHours?: number;
+      preserveActiveEvent?: boolean;
     }
   ): { added: number; updated: number } {
     let added = 0;
     let updated = 0;
+    const addedRecords: AttendanceRecord[] = [];
+    const updatedRecords: AttendanceRecord[] = [];
     const activeEvents = this.getEvents();
     let targetEvent = sanctionOptions?.eventId ? activeEvents.find(e => e.id === sanctionOptions.eventId) : undefined;
 
@@ -1117,7 +1160,7 @@ export class JSONDatabase {
       targetEvent = activeEvents[0] || this.data.events[0];
     }
 
-    if (targetEvent) {
+    if (targetEvent && !sanctionOptions?.preserveActiveEvent) {
       this.setActiveEvent(targetEvent.id);
     }
 
@@ -1140,12 +1183,24 @@ export class JSONDatabase {
       const eventId = rec.eventId || defaultEventId;
       const eventName = cleanRecEvName || defaultEventName;
       const date = rec.date || defaultDate;
-      const timeIn = rec.timeIn !== undefined ? rec.timeIn : null;
-      const timeOut = rec.timeOut !== undefined && rec.timeOut !== 'On Premises' ? rec.timeOut : null;
+      // The summary status depends on whether each scan side exists. None means
+      // no check-in; On Premises means no check-out.
+      const hasTimeIn = Object.prototype.hasOwnProperty.call(rec, 'timeIn');
+      const hasTimeOut = Object.prototype.hasOwnProperty.call(rec, 'timeOut');
+      const rawTimeIn = rec.timeIn === undefined || rec.timeIn === null ? '' : String(rec.timeIn).trim();
+      const timeIn = /^none$/i.test(rawTimeIn) ? '' : rawTimeIn;
+      const rawTimeOut = rec.timeOut === undefined || rec.timeOut === null ? '' : String(rec.timeOut).trim();
+      const timeOut = !rawTimeOut || /^(none|on premises)$/i.test(rawTimeOut) ? null : rawTimeOut;
       const scannedBy = rec.scannedBy || 'XLSX Import';
 
       // Auto register Program, Section, Department, Event in System Setup Registers
-      this.ensureSystemSetupEntities(program, section, department, cleanRecEvName || eventName);
+      const matchingEventAlreadyRegistered = this.data.events.some(event =>
+        event.id === eventId || (
+          event.name.trim().toLocaleLowerCase() === eventName.trim().toLocaleLowerCase()
+          && event.date === date
+        )
+      );
+      this.ensureSystemSetupEntities(program, section, department, matchingEventAlreadyRegistered ? undefined : cleanRecEvName || eventName);
 
       // Auto register student in roster directory if missing
       if (!student) {
@@ -1161,40 +1216,41 @@ export class JSONDatabase {
 
       // Check if existing attendance log exists for student & this specific event
       const existing = this.data.attendance.find(
-        a => a.studentId === studentId && (a.eventId === eventId || (a.eventName && cleanRecEvName && a.eventName.trim().toLowerCase() === cleanRecEvName.trim().toLowerCase()))
+        a => a.studentId === studentId
+          && a.date === date
+          && (a.eventId === eventId || (a.eventName && a.eventName.trim().toLowerCase() === eventName.trim().toLowerCase()))
       );
 
       if (existing) {
         let changed = false;
-        if (timeIn !== undefined && timeIn !== null && timeIn !== '') {
+        if (hasTimeIn && existing.timeIn !== timeIn) {
           existing.timeIn = timeIn;
           changed = true;
         }
-        if (timeOut !== undefined) {
+        if (hasTimeOut && existing.timeOut !== timeOut) {
           existing.timeOut = timeOut;
           changed = true;
         }
+        if (existing.studentName !== studentName) changed = true;
+        if (existing.department !== department) changed = true;
+        if (existing.program !== program) changed = true;
+        if (existing.yearLevel !== yearLevel) changed = true;
+        if (existing.section !== section) changed = true;
+        if (existing.eventId !== eventId) changed = true;
+        if (existing.eventName !== eventName) changed = true;
+        if (existing.date !== date) changed = true;
         existing.studentName = studentName;
         existing.program = program;
         existing.yearLevel = yearLevel;
         existing.section = section;
         existing.department = department;
+        existing.eventId = eventId;
+        existing.eventName = eventName;
+        existing.date = date;
 
         if (changed) {
           updated++;
-          safeDbWrite(async () => {
-            await db.update(attendanceTable)
-              .set({
-                studentName,
-                program,
-                yearLevel,
-                section,
-                department,
-                timeIn: existing.timeIn,
-                timeOut: existing.timeOut
-              })
-              .where(eq(attendanceTable.id, existing.id));
-          }, `import update attendance ${existing.id}`);
+          updatedRecords.push(existing);
         }
       } else {
         const newRecord: AttendanceRecord = {
@@ -1214,15 +1270,37 @@ export class JSONDatabase {
           isFromCsv: true
         };
         this.data.attendance.push(newRecord);
+        addedRecords.push(newRecord);
         added++;
-
-        safeDbWrite(async () => {
-          await db.insert(attendanceTable).values(newRecord);
-        }, `import insert attendance ${newRecord.id}`);
       }
     });
 
     this.save();
+    if (updatedRecords.length > 0 || addedRecords.length > 0) {
+      safeDbWrite(async () => {
+        await db.transaction(async tx => {
+          for (const record of updatedRecords) {
+            await tx.update(attendanceTable).set({
+              studentId: record.studentId,
+              studentName: record.studentName,
+              department: record.department,
+              program: record.program,
+              yearLevel: record.yearLevel,
+              section: record.section,
+              eventId: record.eventId,
+              eventName: record.eventName,
+              date: record.date,
+              timeIn: record.timeIn,
+              timeOut: record.timeOut,
+              scannedBy: record.scannedBy
+            }).where(eq(attendanceTable.id, record.id));
+          }
+          if (addedRecords.length > 0) {
+            await tx.insert(attendanceTable).values(addedRecords);
+          }
+        });
+      }, `import attendance batch (${addedRecords.length} added, ${updatedRecords.length} updated)`);
+    }
     return { added, updated };
   }
 

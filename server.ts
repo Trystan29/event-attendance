@@ -11,7 +11,7 @@ import crypto from 'crypto';
 import { WebSocketServer, WebSocket } from 'ws';
 import { createServer as createViteServer } from 'vite';
 import * as xlsx from 'xlsx';
-import { JSONDatabase } from './server/db.ts';
+import { JSONDatabase, StudentIdConflictError } from './server/db.ts';
 
 async function startServer() {
   const app = express();
@@ -452,7 +452,21 @@ async function startServer() {
     )) {
       return res.status(400).json({ error: 'addUnmatchedNames must be an array of student names.' });
     }
+    const requestedMatchOverrides = req.body.matchOverrides;
+    if (requestedMatchOverrides !== undefined && (
+      !Array.isArray(requestedMatchOverrides) ||
+      requestedMatchOverrides.some((match: unknown) =>
+        !match || typeof match !== 'object'
+        || typeof (match as any).studentId !== 'string'
+        || typeof (match as any).importedName !== 'string'
+      )
+    )) {
+      return res.status(400).json({ error: 'matchOverrides must contain existing student IDs and imported names.' });
+    }
     const fieldsToUpdate = Array.isArray(requestedUpdateFields) ? requestedUpdateFields : [];
+    if (requestedMatchOverrides?.length && (matchBy || 'studentId') !== 'fullName') {
+      return res.status(400).json({ error: 'Manual name matches require matching existing students by name.' });
+    }
     if ((matchBy || 'studentId') === 'studentId' && fieldsToUpdate.includes('studentId')) {
       return res.status(400).json({
         error: 'Choose name matching before updating student IDs.'
@@ -480,11 +494,15 @@ async function startServer() {
         matchBy: matchBy || 'studentId',
         updateFields: requestedUpdateFields,
         replaceExisting: req.body.replaceExisting,
-        addUnmatchedNames: requestedNewNames
+        addUnmatchedNames: requestedNewNames,
+        matchOverrides: requestedMatchOverrides
       });
       broadcastStats();
       res.json({ message: `Successfully parsed student rosters format.`, added, updated, skipped, ambiguous, idUpdated });
     } catch (err) {
+      if (err instanceof StudentIdConflictError) {
+        return res.status(409).json({ error: err.message, conflicts: err.conflicts });
+      }
       res.status(400).json({ error: err instanceof Error ? err.message : 'Student import could not be applied.' });
     }
   });

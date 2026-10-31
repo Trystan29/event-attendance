@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useEffect, useState, useRef } from 'react';
+import React, { useEffect, useMemo, useState, useRef } from 'react';
 import QRCode from 'qrcode';
 import * as XLSX from 'xlsx';
 import { 
@@ -33,6 +33,40 @@ interface ImportWorksheet {
   csv: string;
 }
 
+interface StudentDirectoryCache {
+  students: Student[];
+  departments: Department[];
+  programs: Program[];
+  sections: Section[];
+  cachedAt: number;
+}
+
+const ADD_AS_NEW_IMPORT_ROW = '__add_as_new_student__';
+
+interface ImportReviewRow {
+  importedStudent: Student;
+  selectedStudentId: string;
+  searchQuery: string;
+  isPickerOpen: boolean;
+}
+
+interface PendingImportReview {
+  students: Student[];
+  rows: ImportReviewRow[];
+  reservedStudentIds: string[];
+  duplicateIdSkippedCount: number;
+  rosterConflictSkippedCount: number;
+  headerRowSkipped: boolean;
+  duplicateCsvCount: number;
+  malformedOrEmptyCount: number;
+}
+
+let studentDirectoryCache: StudentDirectoryCache | null = null;
+const getFreshStudentDirectoryCache = () =>
+  studentDirectoryCache && Date.now() - studentDirectoryCache.cachedAt < 60_000
+    ? studentDirectoryCache
+    : null;
+
 const parseCsvLine = (line: string): string[] => {
   const cells: string[] = [];
   let value = '';
@@ -58,10 +92,10 @@ const parseCsvLine = (line: string): string[] => {
 };
 
 export default function StudentManager({ currentUserRole }: StudentManagerProps) {
-  const [students, setStudents] = useState<Student[]>([]);
-  const [departments, setDepartments] = useState<Department[]>([]);
-  const [programs, setPrograms] = useState<Program[]>([]);
-  const [sections, setSections] = useState<Section[]>([]);
+  const [students, setStudents] = useState<Student[]>(() => getFreshStudentDirectoryCache()?.students || []);
+  const [departments, setDepartments] = useState<Department[]>(() => getFreshStudentDirectoryCache()?.departments || []);
+  const [programs, setPrograms] = useState<Program[]>(() => getFreshStudentDirectoryCache()?.programs || []);
+  const [sections, setSections] = useState<Section[]>(() => getFreshStudentDirectoryCache()?.sections || []);
   // Hide 'E' and any section literally named FREE (the "Free Section" option is already built in)
   const filteredSections = sections.filter(s => {
     const n = s.name.trim().toUpperCase();
@@ -75,6 +109,8 @@ export default function StudentManager({ currentUserRole }: StudentManagerProps)
   const [filterCourse, setFilterCourse] = useState('');
   const [filterYear, setFilterYear] = useState('');
   const [filterSec, setFilterSec] = useState('');
+  const [studentPage, setStudentPage] = useState(0);
+  const studentsPerPage = 100;
 
   // Modals / Creators
   const [isNewModalOpen, setIsNewModalOpen] = useState(false);
@@ -107,7 +143,7 @@ export default function StudentManager({ currentUserRole }: StudentManagerProps)
     'fullName', 'department', 'program', 'yearLevel', 'section'
   ]);
   const [updateExistingStudents, setUpdateExistingStudents] = useState(true);
-  const [approvedNewImportNames, setApprovedNewImportNames] = useState('');
+  const [pendingImportReview, setPendingImportReview] = useState<PendingImportReview | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [qrCache, setQrCache] = useState<{ [id: string]: string }>({});
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
@@ -159,38 +195,28 @@ export default function StudentManager({ currentUserRole }: StudentManagerProps)
     fetchData();
   }, []);
 
-  // Pre-generate QR codes images bases for list and modals
   useEffect(() => {
-    const generateQRs = async () => {
-      const cache: { [id: string]: string } = {};
-      for (const s of students) {
-        const qrIdentity = getQrIdentity(s);
-        if (!qrCache[qrIdentity]) {
-          try {
-            // Use high configuration formatting for printable badge standards
-            const qrData = await QRCode.toDataURL(qrIdentity, {
-              width: 250,
-              margin: 2,
-              color: {
-                dark: '#0f172a', // deep navy
-                light: '#ffffff'
-              }
-            });
-            cache[qrIdentity] = qrData;
-          } catch (err) {
-            console.error('Failed generating QR base64 code for student ID', s.studentId, err);
-          }
-        }
-      }
-      if (Object.keys(cache).length > 0) {
-        setQrCache(prev => ({ ...prev, ...cache }));
-      }
-    };
+    studentDirectoryCache = { students, departments, programs, sections, cachedAt: Date.now() };
+  }, [students, departments, programs, sections]);
 
-    if (students.length > 0) {
-      generateQRs();
-    }
-  }, [students]);
+  // Generate QR images only when requested; building every QR at directory load
+  // makes large rosters slow and consumes memory unnecessarily.
+  useEffect(() => {
+    if (!viewedStudent) return;
+    const qrIdentity = getQrIdentity(viewedStudent);
+    if (qrCache[qrIdentity]) return;
+    let cancelled = false;
+    QRCode.toDataURL(qrIdentity, {
+      width: 250,
+      margin: 2,
+      color: { dark: '#0f172a', light: '#ffffff' }
+    }).then(qrData => {
+      if (!cancelled) setQrCache(prev => ({ ...prev, [qrIdentity]: qrData }));
+    }).catch(err => {
+      console.error('Failed generating QR base64 code for student ID', viewedStudent.studentId, err);
+    });
+    return () => { cancelled = true; };
+  }, [viewedStudent, qrCache]);
 
   // Handle single student adding manually
   const handleAddStudent = async (e: React.FormEvent) => {
@@ -408,6 +434,146 @@ export default function StudentManager({ currentUserRole }: StudentManagerProps)
   );
   const importPreviewRows = matchingPreviewRows.slice(0, 6);
 
+  const submitStudentImport = async (review: PendingImportReview, matchOverrides: Array<{ studentId: string; importedName: string; importedStudentId?: string }>) => {
+    setIsImportModalOpen(false);
+    setPendingImportReview(null);
+    try {
+      const res = await fetch('/api/students/import', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          students: review.students,
+          matchBy: importMatchBy,
+          updateFields: updateExistingStudents ? importUpdateFields : [],
+          replaceExisting: updateExistingStudents,
+          addUnmatchedNames: review.rows
+            .filter(row => row.selectedStudentId === ADD_AS_NEW_IMPORT_ROW)
+            .map(row => row.importedStudent.fullName),
+          matchOverrides
+        })
+      });
+
+      if (!res.ok) {
+        const error = await res.json();
+        const importError = new Error(error.error || 'Roster import processing failure on backend.') as Error & {
+          conflicts?: Array<{ studentId: string; currentOwnerName: string; incomingName: string }>;
+        };
+        importError.conflicts = Array.isArray(error.conflicts) ? error.conflicts : undefined;
+        throw importError;
+      }
+
+      const stats = await res.json();
+      let message = `Roster successfully imported! Added: ${stats.added} new records, Updated: ${stats.updated} existing records, Skipped: ${stats.skipped || 0} existing records.`;
+      if (review.duplicateIdSkippedCount > 0) message += ` Skipped ${review.duplicateIdSkippedCount} row(s) with duplicate student IDs.`;
+      if (review.rosterConflictSkippedCount > 0) message += ` Skipped ${review.rosterConflictSkippedCount} row(s) whose IDs were already assigned in the roster.`;
+      if (stats.ambiguous > 0) message += ` Ambiguous matches skipped: ${stats.ambiguous}.`;
+      if (stats.idUpdated > 0) {
+        message += ` Student IDs corrected for ${stats.idUpdated} students; existing QR badges and attendance reports are preserved.`;
+      }
+      const skipNotes: string[] = [];
+      if (review.headerRowSkipped) skipNotes.push('skipped 1 header row');
+      if (review.duplicateCsvCount > 0) skipNotes.push(`resolved ${review.duplicateCsvCount} duplicate IDs inside the file`);
+      if (review.malformedOrEmptyCount > 0) skipNotes.push(`skipped ${review.malformedOrEmptyCount} malformed/empty rows`);
+      if (skipNotes.length > 0) message += ` (${skipNotes.join(', ')}).`;
+
+      setSuccessMessage(message);
+      setImportCsvInput('');
+      setImportFileName('');
+      setImportWorksheets([]);
+      setSelectedImportWorksheet('');
+      setImportPreviewSearch('');
+      setIsImportModalOpen(false);
+      setPendingImportReview(null);
+      fetchData();
+    } catch (err: any) {
+      const errorMessage = err.message || 'Failed transmitting batch data.';
+      const idConflicts = Array.isArray(err.conflicts) ? err.conflicts as Array<{
+        studentId: string;
+        currentOwnerName: string;
+        incomingName: string;
+      }> : [];
+      if (idConflicts.length > 0) {
+        const conflictList = idConflicts.map(conflict =>
+          `• ${conflict.studentId}: currently ${conflict.currentOwnerName}; import assigns it to ${conflict.incomingName}`
+        );
+        const omittedCount = Math.max(0, conflictList.length - 12);
+        const confirmationText = [
+          `${idConflicts.length} student ID conflict(s) block this import:`,
+          ...conflictList.slice(0, 12),
+          ...(omittedCount ? [`…and ${omittedCount} more.`] : []),
+          '',
+          'Skip all conflicting imported student rows and import the rest?'
+        ].join('\n');
+        if (!window.confirm(confirmationText)) {
+          setErrorMessage(`${errorMessage} No changes were applied. Correct the IDs or matches and import again.`);
+          return;
+        }
+
+        const conflictKeys = new Set(idConflicts.map(conflict =>
+          `${conflict.studentId.trim().toLocaleLowerCase()}\u0000${normalizeStudentName(conflict.incomingName).toLocaleLowerCase()}`
+        ));
+        const isConflictingImport = (student: Student) =>
+          conflictKeys.has(`${student.studentId.trim().toLocaleLowerCase()}\u0000${normalizeStudentName(student.fullName).toLocaleLowerCase()}`);
+        const nextReview = {
+          ...review,
+          students: review.students.filter(student => !isConflictingImport(student)),
+          rows: review.rows.filter(row => !isConflictingImport(row.importedStudent)),
+          rosterConflictSkippedCount: review.rosterConflictSkippedCount + idConflicts.length
+        };
+        const nextOverrides = matchOverrides.filter(match =>
+          !conflictKeys.has(`${(match.importedStudentId || '').trim().toLocaleLowerCase()}\u0000${normalizeStudentName(match.importedName).toLocaleLowerCase()}`)
+        );
+        const skippedCount = review.students.length - nextReview.students.length;
+        if (skippedCount === 0) {
+          setErrorMessage('The conflicting rows could not be located in this pending import, so nothing was retried. Reopen the file and check its IDs and names.');
+          return;
+        }
+        if (nextReview.students.length === 0) {
+          setErrorMessage('All imported rows with student ID conflicts were skipped; no changes were applied.');
+          return;
+        }
+        await submitStudentImport(nextReview, nextOverrides);
+        return;
+      }
+      const rosterIdConflict = errorMessage.match(/Student ID "([^"]+)" is still assigned to "([^"]+)" in the existing roster, and the import also assigns it to "([^"]+)"/i);
+      if (rosterIdConflict) {
+        const [, conflictingId, currentOwnerName, incomingName] = rosterIdConflict;
+        if (window.confirm(
+          `Student ID "${conflictingId}" already belongs to ${currentOwnerName}, but this import assigns it to ${incomingName}. Skip ${incomingName} and continue importing the other students?`
+        )) {
+          const normalizedIncomingName = normalizeStudentName(incomingName).toLocaleLowerCase();
+          const normalizedConflictingId = conflictingId.trim().toLocaleLowerCase();
+          const isConflictingImport = (student: Student) =>
+            student.studentId.trim().toLocaleLowerCase() === normalizedConflictingId
+            || normalizeStudentName(student.fullName).toLocaleLowerCase() === normalizedIncomingName;
+          const nextReview = {
+            ...review,
+            students: review.students.filter(student => !isConflictingImport(student)),
+            rows: review.rows.filter(row => !isConflictingImport(row.importedStudent)),
+            rosterConflictSkippedCount: review.rosterConflictSkippedCount + 1
+          };
+          const nextOverrides = matchOverrides.filter(match =>
+            !(
+              (match.importedStudentId && match.importedStudentId.trim().toLocaleLowerCase() === normalizedConflictingId)
+              || normalizeStudentName(match.importedName).toLocaleLowerCase() === normalizedIncomingName
+            )
+          );
+          if (nextReview.students.length === review.students.length) {
+            setErrorMessage(`The conflicting row for ${incomingName} could not be located in the pending import, so it was not retried. Reopen the file and check the imported ID/name values.`);
+            return;
+          }
+          if (nextReview.students.length === 0) {
+            setErrorMessage('All imported rows with roster ID conflicts were skipped; no changes were applied.');
+            return;
+          }
+          await submitStudentImport(nextReview, nextOverrides);
+          return;
+        }
+      }
+      setErrorMessage(errorMessage);
+    }
+  };
+
   const processImport = async () => {
     setErrorMessage(null);
     setSuccessMessage(null);
@@ -531,52 +697,38 @@ export default function StudentManager({ currentUserRole }: StudentManagerProps)
       }
     }
 
-    try {
-      const res = await fetch('/api/students/import', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          students: studentsToImport,
-          matchBy: importMatchBy,
-          updateFields: updateExistingStudents ? importUpdateFields : [],
-          replaceExisting: updateExistingStudents,
-          addUnmatchedNames: approvedNewImportNames.split(/\r?\n/).map(name => name.trim()).filter(Boolean)
-        })
-      });
-
-      if (!res.ok) {
-        const error = await res.json();
-        throw new Error(error.error || 'Roster import processing failure on backend.');
+    const review: PendingImportReview = {
+      students: studentsToImport,
+      rows: [],
+      reservedStudentIds: [],
+      duplicateIdSkippedCount,
+      rosterConflictSkippedCount: 0,
+      headerRowSkipped,
+      duplicateCsvCount,
+      malformedOrEmptyCount
+    };
+    if (updateExistingStudents && importMatchBy === 'fullName' && importUpdateFields.includes('studentId')) {
+      const alreadyMatched = new Set<string>();
+      for (const importedStudent of studentsToImport) {
+        let matches = students.filter(student => studentNamesMatch(student.fullName, importedStudent.fullName));
+        if (matches.length === 0) {
+          matches = students.filter(student => studentNamesMatch(student.fullName, importedStudent.fullName, true));
+        }
+        if (matches.length === 1 && !alreadyMatched.has(matches[0].studentId)) {
+          alreadyMatched.add(matches[0].studentId);
+          continue;
+        }
+        review.rows.push({ importedStudent, selectedStudentId: '', searchQuery: '', isPickerOpen: false });
       }
-
-      const stats = await res.json();
-      
-      let message = `Roster successfully imported! Added: ${stats.added} new records, Updated: ${stats.updated} existing records, Skipped: ${stats.skipped || 0} existing records.`;
-      if (duplicateIdSkippedCount > 0) message += ` Skipped ${duplicateIdSkippedCount} row(s) with duplicate student IDs.`;
-      if (stats.ambiguous > 0) message += ` Ambiguous matches skipped: ${stats.ambiguous}.`;
-      if (stats.idUpdated > 0) {
-        message += ` Student IDs corrected for ${stats.idUpdated} students; existing QR badges and attendance reports are preserved.`;
-      }
-      const skipNotes: string[] = [];
-      if (headerRowSkipped) skipNotes.push('skipped 1 header row');
-      if (duplicateCsvCount > 0) skipNotes.push(`resolved ${duplicateCsvCount} duplicate IDs inside the file`);
-      if (malformedOrEmptyCount > 0) skipNotes.push(`skipped ${malformedOrEmptyCount} malformed/empty rows`);
-      
-      if (skipNotes.length > 0) {
-        message += ` (${skipNotes.join(', ')}).`;
-      }
-      
-      setSuccessMessage(message);
-      setImportCsvInput('');
-      setImportFileName('');
-      setImportWorksheets([]);
-      setSelectedImportWorksheet('');
-      setImportPreviewSearch('');
-      setIsImportModalOpen(false);
-      fetchData();
-    } catch (err: any) {
-      setErrorMessage(err.message || 'Failed transmitting batch data.');
+      review.reservedStudentIds = [...alreadyMatched];
     }
+
+    if (review.rows.length > 0) {
+      setPendingImportReview(review);
+      setErrorMessage(null);
+      return;
+    }
+    await submitStudentImport(review, []);
   };
 
   // Highlight searched term in text with safe escaping of regex characters
@@ -606,33 +758,51 @@ export default function StudentManager({ currentUserRole }: StudentManagerProps)
   };
 
   // Filter students based on state UI inputs
-  const filteredStudents = students.filter(s => {
-    const matchesSearch = searchQuery.trim() === '' ||
-                          (s.fullName || '').toLowerCase().includes(searchQuery.toLowerCase()) || 
-                          (s.studentId || '').toLowerCase().includes(searchQuery.toLowerCase());
-    
-    const matchesDept = filterDept === '' || s.department === filterDept;
-    const matchesCourse = filterCourse === '' || s.program === filterCourse;
-    const matchesYear = filterYear === '' || (filterYear === 'FREE' ? isFreeYear(s.yearLevel) : String(s.yearLevel).trim() === filterYear);
-    const matchesSec = filterSec === '' ? true : (filterSec === 'FREE' ? ((s.section || '') === '' || (s.section || '').toUpperCase() === 'FREE') : s.section === filterSec);
+  const filteredStudents = useMemo(() => {
+    const query = searchQuery.trim().toLocaleLowerCase();
+    return students.filter(s => {
+      const matchesSearch = !query
+        || (s.fullName || '').toLocaleLowerCase().includes(query)
+        || (s.studentId || '').toLocaleLowerCase().includes(query);
+      const matchesDept = filterDept === '' || s.department === filterDept;
+      const matchesCourse = filterCourse === '' || s.program === filterCourse;
+      const matchesYear = filterYear === '' || (filterYear === 'FREE' ? isFreeYear(s.yearLevel) : String(s.yearLevel).trim() === filterYear);
+      const matchesSec = filterSec === '' ? true : (filterSec === 'FREE' ? ((s.section || '') === '' || (s.section || '').toUpperCase() === 'FREE') : s.section === filterSec);
+      return matchesSearch && matchesDept && matchesCourse && matchesYear && matchesSec;
+    }).sort((a, b) => {
+      const compareText = (left: string, right: string) =>
+        left.localeCompare(right, undefined, { sensitivity: 'base', numeric: true });
+      const yearA = Number(a.yearLevel);
+      const yearB = Number(b.yearLevel);
+      const yearCompare = Number.isFinite(yearA) && Number.isFinite(yearB)
+        ? yearA - yearB
+        : compareText(a.yearLevel, b.yearLevel);
 
-    return matchesSearch && matchesDept && matchesCourse && matchesYear && matchesSec;
-  }).sort((a, b) => {
-    const compareText = (left: string, right: string) =>
-      left.localeCompare(right, undefined, { sensitivity: 'base', numeric: true });
-    const yearA = Number(a.yearLevel);
-    const yearB = Number(b.yearLevel);
-    const yearCompare = Number.isFinite(yearA) && Number.isFinite(yearB)
-      ? yearA - yearB
-      : compareText(a.yearLevel, b.yearLevel);
+      return compareText(a.department, b.department)
+        || compareText(a.program, b.program)
+        || yearCompare
+        || compareText(a.section || 'Free Section', b.section || 'Free Section')
+        || compareText(a.fullName, b.fullName)
+        || compareText(a.studentId, b.studentId);
+    });
+  }, [students, searchQuery, filterDept, filterCourse, filterYear, filterSec]);
 
-    return compareText(a.department, b.department)
-      || compareText(a.program, b.program)
-      || yearCompare
-      || compareText(a.section || 'Free Section', b.section || 'Free Section')
-      || compareText(a.fullName, b.fullName)
-      || compareText(a.studentId, b.studentId);
-  });
+  const totalStudentPages = Math.max(1, Math.ceil(filteredStudents.length / studentsPerPage));
+  const visibleStudents = filteredStudents.slice(studentPage * studentsPerPage, (studentPage + 1) * studentsPerPage);
+  const pendingReviewIds = pendingImportReview?.rows
+    .map(row => row.selectedStudentId)
+    .filter(id => id && id !== ADD_AS_NEW_IMPORT_ROW) || [];
+  const pendingReviewReady = Boolean(pendingImportReview)
+    && pendingImportReview!.rows.every(row => row.selectedStudentId)
+    && new Set(pendingReviewIds).size === pendingReviewIds.length;
+
+  useEffect(() => {
+    setStudentPage(0);
+  }, [searchQuery, filterDept, filterCourse, filterYear, filterSec]);
+
+  useEffect(() => {
+    if (studentPage >= totalStudentPages) setStudentPage(totalStudentPages - 1);
+  }, [studentPage, totalStudentPages]);
 
   const getStudentGroupKey = (student: Student) =>
     [student.department, student.program, student.yearLevel, student.section || ''].join('\u0000').toLocaleLowerCase();
@@ -644,13 +814,34 @@ export default function StudentManager({ currentUserRole }: StudentManagerProps)
     return `${student.department} · ${student.program} · ${year} · ${student.section ? `Section ${student.section}` : 'Free Section'}`;
   };
 
+  const getQrCodesFor = async (targetStudents: Student[]) => {
+    const cache = { ...qrCache };
+    const uniqueIdentities = [...new Set(targetStudents.map(getQrIdentity))];
+    const missing = uniqueIdentities.filter(identity => !cache[identity]);
+    for (let index = 0; index < missing.length; index += 40) {
+      const batch = missing.slice(index, index + 40);
+      const generated = await Promise.all(batch.map(async identity => {
+        const qrData = await QRCode.toDataURL(identity, {
+          width: 250,
+          margin: 2,
+          color: { dark: '#0f172a', light: '#ffffff' }
+        });
+        return [identity, qrData] as const;
+      }));
+      generated.forEach(([identity, qrData]) => { cache[identity] = qrData; });
+    }
+    if (missing.length > 0) setQrCache(previous => ({ ...previous, ...cache }));
+    return cache;
+  };
+
   // Printer logic for 8 QR cards per A4 page in portrait PDF layout
-  const handlePrintBadge = () => {
+  const handlePrintBadge = async () => {
     const printWindow = window.open('', '_blank');
     if (!printWindow) {
       alert('Allow browser pop-ups to open printing layout sheets.');
       return;
     }
+    const qrCodes = await getQrCodesFor(filteredStudents);
 
     // Pack students into chunks of up to 8 cards per A4 page
     const chunkArray = (arr: Student[], size: number) => {
@@ -665,7 +856,7 @@ export default function StudentManager({ currentUserRole }: StudentManagerProps)
 
     const pagesHtml = studentChunks.map((chunk) => {
       const cardsHtml = chunk.map(s => {
-        const qrData = qrCache[getQrIdentity(s)] || '';
+        const qrData = qrCodes[getQrIdentity(s)] || '';
         return `
           <div class="qr-card">
             <div class="institution">CET Student QR Pass</div>
@@ -852,7 +1043,8 @@ export default function StudentManager({ currentUserRole }: StudentManagerProps)
   };
 
   // Download all filtered student badges as a self-contained HTML page
-  const handleDownloadBulkBadges = () => {
+  const handleDownloadBulkBadges = async () => {
+    const qrCodes = await getQrCodesFor(filteredStudents);
     const chunkArray = (arr: Student[], size: number) => {
       const chunks: Student[][] = [];
       for (let i = 0; i < arr.length; i += size) {
@@ -865,7 +1057,7 @@ export default function StudentManager({ currentUserRole }: StudentManagerProps)
 
     const pagesHtml = studentChunks.map((chunk) => {
       const cardsHtml = chunk.map(s => {
-        const qrData = qrCache[getQrIdentity(s)] || '';
+        const qrData = qrCodes[getQrIdentity(s)] || '';
         return `
           <div class="qr-card">
             <div class="institution">CET Student QR Pass</div>
@@ -1340,12 +1532,13 @@ export default function StudentManager({ currentUserRole }: StudentManagerProps)
               </thead>
               <tbody className="divide-y divide-slate-100 text-slate-700">
                 {filteredStudents.length > 0 ? (
-                  filteredStudents.map((student, index) => {
+                  visibleStudents.map((student, index) => {
                     const isEditing = editingStudentId === student.studentId;
-                    const previousStudent = filteredStudents[index - 1];
+                    const globalIndex = studentPage * studentsPerPage + index;
+                    const previousStudent = globalIndex > 0 ? filteredStudents[globalIndex - 1] : undefined;
                     return (
                       <React.Fragment key={student.studentId}>
-                        {(!previousStudent || getStudentGroupKey(previousStudent) !== getStudentGroupKey(student)) && (
+                        {(index === 0 || !previousStudent || getStudentGroupKey(previousStudent) !== getStudentGroupKey(student)) && (
                           <tr className="bg-slate-50 border-y border-slate-200">
                             <td colSpan={currentUserRole === 'admin' ? 7 : 6} className="px-4 py-2 text-[11px] font-bold uppercase tracking-wide text-slate-600">
                               {getStudentGroupLabel(student)}
@@ -1512,8 +1705,24 @@ export default function StudentManager({ currentUserRole }: StudentManagerProps)
           </div>
           
           <div className="p-4 border-t bg-slate-50 text-slate-400 text-[11px] flex justify-between items-center bg-slate-100/50">
-            <span>Showing <strong className="font-bold text-slate-600">{filteredStudents.length}</strong> of {students.length} registers</span>
-            <span>Batch operations require Admin clearance</span>
+            <span>
+              Showing <strong className="font-bold text-slate-600">{filteredStudents.length === 0 ? 0 : studentPage * studentsPerPage + 1}–{Math.min((studentPage + 1) * studentsPerPage, filteredStudents.length)}</strong> of {filteredStudents.length} matching students ({students.length} total)
+            </span>
+            <div className="flex items-center gap-2">
+              <span className="hidden sm:inline">Page {studentPage + 1} of {totalStudentPages}</span>
+              <button
+                type="button"
+                disabled={studentPage === 0}
+                onClick={() => setStudentPage(page => Math.max(0, page - 1))}
+                className="rounded border px-2 py-1 text-slate-600 disabled:opacity-40"
+              >Previous</button>
+              <button
+                type="button"
+                disabled={studentPage + 1 >= totalStudentPages}
+                onClick={() => setStudentPage(page => Math.min(totalStudentPages - 1, page + 1))}
+                className="rounded border px-2 py-1 text-slate-600 disabled:opacity-40"
+              >Next</button>
+            </div>
           </div>
         </div>
 
@@ -2044,22 +2253,9 @@ export default function StudentManager({ currentUserRole }: StudentManagerProps)
               </label>
 
               {updateExistingStudents && importMatchBy === 'fullName' && importUpdateFields.includes('studentId') && (
-                <div className="space-y-1.5 rounded-lg border border-amber-200 bg-amber-50 p-3">
-                  <label className="block text-[11px] font-bold text-slate-700 uppercase" htmlFor="approved-new-import-names">
-                    Exact names approved as new students
-                  </label>
-                  <textarea
-                    id="approved-new-import-names"
-                    rows={2}
-                    value={approvedNewImportNames}
-                    onChange={e => setApprovedNewImportNames(e.target.value)}
-                    placeholder={'One full name per line, for example:\nMolano, Mark Justin Carl B.'}
-                    className="w-full rounded border border-amber-200 bg-white p-2 text-xs"
-                  />
-                  <p className="text-[10px] text-slate-600">
-                    Only names listed here can be added when no existing student matches. Any other unmatched or ambiguous name stops the whole ID update without applying changes.
-                  </p>
-                </div>
+                <p className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-[10px] text-slate-600">
+                  Students the importer can’t confidently match will open a review popup. Choose the correct existing roster record, or explicitly choose Add as a new student for a genuinely new person. Check both Student ID and Name above to update both values while preserving QR badges and attendance.
+                </p>
               )}
 
               <div className="flex gap-2 justify-end pt-4 border-t">
@@ -2078,6 +2274,160 @@ export default function StudentManager({ currentUserRole }: StudentManagerProps)
                   Submit Roster
                 </button>
               </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {pendingImportReview && (
+        <div className="fixed inset-0 z-[60] flex items-center justify-center bg-slate-950/60 p-4 backdrop-blur-sm">
+          <div className="flex max-h-[90vh] w-full max-w-5xl flex-col overflow-hidden rounded-xl bg-white shadow-2xl">
+            <div className="border-b border-amber-200 bg-amber-50 p-5">
+              <h3 className="font-bold text-slate-900">Confirm student matches</h3>
+              <p className="mt-1 text-xs text-slate-600">
+              {pendingImportReview.rows.length} imported row(s) need your review. Choose the existing roster record for each imported name, or explicitly choose Add as a new student for a genuinely new record.
+              </p>
+              {errorMessage && (
+                <p className="mt-3 rounded border border-rose-200 bg-rose-50 p-2 text-xs text-rose-700">{errorMessage}</p>
+              )}
+            </div>
+            <div className="overflow-auto p-4">
+              <table className="w-full min-w-[760px] text-left text-xs">
+                <thead className="sticky top-0 bg-slate-100 text-slate-600">
+                  <tr>
+                    <th className="p-2">Imported ID</th>
+                    <th className="p-2">Imported name</th>
+                    <th className="p-2">Choose existing record or add new</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100">
+                  {pendingImportReview.rows.map((row, index) => (
+                    <tr key={`${row.importedStudent.studentId}-${row.importedStudent.fullName}-${index}`}>
+                      <td className="p-2 font-mono font-semibold text-blue-900">{row.importedStudent.studentId}</td>
+                      <td className="p-2 font-medium text-slate-800">{row.importedStudent.fullName}</td>
+                      <td className="p-2">
+                        <div className="relative">
+                          <input
+                            type="search"
+                            value={row.searchQuery}
+                            onFocus={() => setPendingImportReview(current => current ? {
+                              ...current,
+                              rows: current.rows.map((item, itemIndex) => itemIndex === index ? { ...item, isPickerOpen: true } : item)
+                            } : current)}
+                            onBlur={() => window.setTimeout(() => setPendingImportReview(current => current ? {
+                              ...current,
+                              rows: current.rows.map((item, itemIndex) => itemIndex === index ? { ...item, isPickerOpen: false } : item)
+                            } : current), 100)}
+                            onChange={event => {
+                              setErrorMessage(null);
+                              setPendingImportReview(current => current ? {
+                                ...current,
+                                rows: current.rows.map((item, itemIndex) => itemIndex === index
+                                  ? { ...item, searchQuery: event.target.value, selectedStudentId: '', isPickerOpen: true }
+                                  : item)
+                              } : current);
+                            }}
+                            placeholder="Type a student ID or name..."
+                            className="w-full rounded border border-slate-300 bg-white px-3 py-2"
+                            aria-label={`Search current records for ${row.importedStudent.fullName}`}
+                            aria-expanded={row.isPickerOpen}
+                            aria-autocomplete="list"
+                          />
+                          {row.isPickerOpen && (() => {
+                            const query = row.searchQuery.trim().toLocaleLowerCase();
+                            const alreadySelectedIds = pendingImportReview.rows
+                              .filter((item, itemIndex) => itemIndex !== index && item.selectedStudentId !== ADD_AS_NEW_IMPORT_ROW)
+                              .map(item => item.selectedStudentId);
+                            const matchingStudents = students.filter(student => {
+                              if (pendingImportReview.reservedStudentIds.includes(student.studentId)
+                                || alreadySelectedIds.includes(student.studentId)) return false;
+                              const searchFields = `${student.studentId} ${student.fullName} ${student.program} ${student.yearLevel} ${student.section}`.toLocaleLowerCase();
+                              return !query || searchFields.includes(query);
+                            }).slice(0, 30);
+                            return (
+                              <div className="absolute z-20 mt-1 max-h-64 w-full overflow-auto rounded-md border border-slate-200 bg-white py-1 shadow-xl" role="listbox">
+                                {matchingStudents.length > 0 ? matchingStudents.map(student => (
+                                  <button
+                                    key={student.studentId}
+                                    type="button"
+                                    role="option"
+                                    aria-selected={row.selectedStudentId === student.studentId}
+                                    onMouseDown={event => event.preventDefault()}
+                                    onClick={() => {
+                                      setErrorMessage(null);
+                                      setPendingImportReview(current => current ? {
+                                        ...current,
+                                        rows: current.rows.map((item, itemIndex) => itemIndex === index
+                                          ? {
+                                              ...item,
+                                              selectedStudentId: student.studentId,
+                                              searchQuery: `${student.studentId} — ${student.fullName}`,
+                                              isPickerOpen: false
+                                            }
+                                          : item)
+                                      } : current);
+                                    }}
+                                    className="block w-full px-3 py-2 text-left hover:bg-indigo-50"
+                                  >
+                                    <span className="font-mono font-semibold text-blue-900">{student.studentId}</span>
+                                    <span className="ml-2 text-slate-800">{student.fullName}</span>
+                                    <span className="ml-2 text-slate-500">{student.program}, Year {student.yearLevel}{student.section ? `, Section ${student.section}` : ''}</span>
+                                  </button>
+                                )) : (
+                                  <p className="px-3 py-2 text-slate-500">No matching current students.</p>
+                                )}
+                                <button
+                                  type="button"
+                                  role="option"
+                                  aria-selected={row.selectedStudentId === ADD_AS_NEW_IMPORT_ROW}
+                                  onMouseDown={event => event.preventDefault()}
+                                  onClick={() => {
+                                    setErrorMessage(null);
+                                    setPendingImportReview(current => current ? {
+                                      ...current,
+                                      rows: current.rows.map((item, itemIndex) => itemIndex === index
+                                        ? { ...item, selectedStudentId: ADD_AS_NEW_IMPORT_ROW, searchQuery: 'Add as a new student', isPickerOpen: false }
+                                        : item)
+                                    } : current);
+                                  }}
+                                  className="mt-1 block w-full border-t border-slate-100 px-3 py-2 text-left font-semibold text-indigo-700 hover:bg-indigo-50"
+                                >Add as a new student</button>
+                              </div>
+                            );
+                          })()}
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+              {new Set(pendingReviewIds).size !== pendingReviewIds.length && (
+                <p className="mt-3 text-xs text-rose-600">Each imported row must map to a different existing student.</p>
+              )}
+            </div>
+            <div className="flex justify-end gap-2 border-t bg-slate-50 p-4">
+              <button
+                type="button"
+                onClick={() => { setPendingImportReview(null); setErrorMessage(null); }}
+                className="rounded border border-slate-300 bg-white px-4 py-2 text-xs font-semibold text-slate-700"
+              >Back to import</button>
+              <button
+                type="button"
+                disabled={!pendingReviewReady}
+                onClick={() => {
+                  const review = pendingImportReview;
+                  if (!review) return;
+                  const matchOverrides = review.rows
+                    .filter(row => row.selectedStudentId !== ADD_AS_NEW_IMPORT_ROW)
+                    .map(row => ({
+                      studentId: row.selectedStudentId,
+                      importedName: row.importedStudent.fullName,
+                      importedStudentId: row.importedStudent.studentId
+                    }));
+                  void submitStudentImport(review, matchOverrides);
+                }}
+                className="rounded bg-indigo-600 px-4 py-2 text-xs font-semibold text-white disabled:cursor-not-allowed disabled:opacity-50"
+              >Confirm and import</button>
             </div>
           </div>
         </div>
